@@ -1,34 +1,14 @@
 # app/models/message.py
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import re
-import signal
-import time
-from contextlib import contextmanager
 
-@contextmanager
-def timeout_regex(seconds: int = 1):
-    """Context manager для таймаута regex операций"""
-    def timeout_handler(signum, frame):
-        raise TimeoutError("Regex operation timeout")
-    
-    # Сохраняем старый обработчик
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
-    
+def safe_regex_sub(pattern: str, replacement: str, text: str) -> str:
+    """Безопасная замена regex"""
     try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-def safe_regex_sub(pattern: str, replacement: str, text: str, timeout_seconds: int = 1) -> str:
-    """Безопасная замена regex с таймаутом"""
-    try:
-        with timeout_regex(timeout_seconds):
-            return re.sub(pattern, replacement, text)
-    except TimeoutError:
+        return re.sub(pattern, replacement, text)
+    except Exception:
         # Fallback: простая замена строк без regex
         if pattern == r'<@!?\d+>':
             # Упрощенная замена для user mentions
@@ -68,11 +48,7 @@ def safe_regex_sub(pattern: str, replacement: str, text: str, timeout_seconds: i
                 result = result[:start] + replacement + result[end+1:]
             return result
         else:
-            # Для других паттернов просто возвращаем исходный текст
             return text
-    except Exception:
-        # При любой другой ошибке возвращаем исходный текст
-        return text
 
 def normalize_datetime(dt: datetime) -> datetime:
     """Normalize datetime to UTC with timezone info"""
@@ -124,20 +100,20 @@ class DiscordMessage(BaseModel):
     processed_at: Optional[datetime] = None
     telegram_message_id: Optional[int] = None
     
-    @validator('content', pre=True)
+    @field_validator('content', mode='before')
+    @classmethod
     def clean_content(cls, v):
-        """Clean and sanitize message content with ReDoS protection"""
+        """Clean and sanitize message content"""
         if not v:
             raise ValueError('Message content cannot be empty')
         
-        # ИСПРАВЛЕНИЕ: Используем защищенные regex операции
+        # Remove Discord mentions and clean formatting
         try:
-            # Remove Discord mentions and clean formatting с таймаутом
             v = safe_regex_sub(r'<@!?\d+>', '[User]', v)      # User mentions
             v = safe_regex_sub(r'<#\d+>', '[Channel]', v)      # Channel mentions  
             v = safe_regex_sub(r'<@&\d+>', '[Role]', v)        # Role mentions
-        except Exception as e:
-            # Если все regex операции не удались, используем простую очистку
+        except Exception:
+            # Fallback: простая очистка
             v = v.replace('<@', '[User').replace('<#', '[Channel').replace('<@&', '[Role')
         
         # Trim whitespace
@@ -148,7 +124,8 @@ class DiscordMessage(BaseModel):
         
         return v
     
-    @validator('timestamp', pre=True)
+    @field_validator('timestamp', mode='before')
+    @classmethod
     def validate_timestamp(cls, v):
         """Ensure timestamp has proper timezone and is not in the future"""
         if isinstance(v, str):
@@ -168,7 +145,8 @@ class DiscordMessage(BaseModel):
         
         return v
     
-    @validator('processed_at', pre=True)
+    @field_validator('processed_at', mode='before')
+    @classmethod
     def validate_processed_at(cls, v):
         """Ensure processed_at has proper timezone"""
         if v is None:
@@ -181,16 +159,17 @@ class DiscordMessage(BaseModel):
         
         return v
     
-    @validator('server_name', 'channel_name', 'author', pre=True)
+    @field_validator('server_name', 'channel_name', 'author', mode='before')
+    @classmethod
     def clean_names(cls, v):
-        """Clean server, channel, and author names with safe regex"""
+        """Clean server, channel, and author names"""
         if not v:
             raise ValueError('Name cannot be empty')
         
-        # ИСПРАВЛЕНИЕ: Безопасная очистка имен
+        # Безопасная очистка имен
         try:
-            # Remove problematic characters с таймаутом
-            v = safe_regex_sub(r'[^\w\s\-\.]', '', v, timeout_seconds=1)
+            # Remove problematic characters
+            v = safe_regex_sub(r'[^\w\s\-\.]', '', v)
         except Exception:
             # Fallback: удаляем только самые проблемные символы
             problematic_chars = ['<', '>', '@', '#', '&', '|', '`', '*', '_', '~']
@@ -223,17 +202,17 @@ class DiscordMessage(BaseModel):
         
         return "\n".join(parts)
     
-    class Config:
+    model_config = {
         # Allow datetime to be set from various formats
-        json_encoders = {
+        "json_encoders": {
             datetime: lambda v: v.isoformat() if v else None
-        }
+        },
         
         # Use enum values
-        use_enum_values = True
+        "use_enum_values": True,
         
         # Example for JSON schema generation
-        json_schema_extra = {
+        "json_schema_extra": {
             "example": {
                 "content": "🎉 New feature released!",
                 "timestamp": "2024-01-15T12:00:00+00:00",
@@ -243,3 +222,4 @@ class DiscordMessage(BaseModel):
                 "message_id": "1234567890123456789"
             }
         }
+    }

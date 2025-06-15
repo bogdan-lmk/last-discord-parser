@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     
     # Application Settings
     app_name: str = "Discord Telegram Parser MVP"
-    app_version: str = "2.0.0"
+    app_version: str = "2.1.0"
     debug: bool = Field(default=False, env="DEBUG")
     
     # Discord Configuration
@@ -86,7 +86,7 @@ class Settings(BaseSettings):
     @field_validator('discord_auth_tokens')
     @classmethod
     def validate_discord_tokens(cls, v):
-        """Validate Discord tokens"""
+        """Validate Discord tokens with relaxed validation"""
         if isinstance(v, str):
             tokens = [token.strip() for token in v.split(',') if token.strip()]
         else:
@@ -96,14 +96,8 @@ class Settings(BaseSettings):
             raise ValueError('At least one Discord token is required')
         
         for i, token in enumerate(tokens):
-            if not token or len(token.strip()) < 50:
+            if not token or len(token.strip()) < 20:  # Relaxed minimum length
                 raise ValueError(f'Invalid Discord token format at position {i+1}: token too short')
-            
-            # Basic format check - Discord tokens should start with specific patterns
-            token_clean = token.strip()
-            if not (token_clean.startswith('MT') or token_clean.startswith('mT') or 
-                   token_clean.startswith('OT') or token_clean.startswith('oT')):
-                raise ValueError(f'Invalid Discord token format at position {i+1}: invalid prefix')
         
         return v
     
