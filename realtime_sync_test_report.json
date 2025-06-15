@@ -1,0 +1,26 @@
+{
+  "timestamp": "2025-06-15T22:55:19.527343",
+  "test_duration_seconds": 0.316173,
+  "websocket_test": {
+    "total_tokens": 1,
+    "successful_connections": 0,
+    "failed_connections": 1,
+    "success_rate_percent": 0.0,
+    "average_connection_time": 0,
+    "heartbeat_responses": 0,
+    "ready_events": 0,
+    "message_events": 0
+  },
+  "realtime_capabilities": {
+    "websocket_supported": false,
+    "heartbeat_working": false,
+    "event_receiving": false,
+    "message_monitoring": true
+  },
+  "errors": [],
+  "recommendations": [
+    "❌ Много неработающих токенов, проверьте их валидность",
+    "❌ Heartbeat не работает - проблемы с соединением",
+    "❌ Нет READY событий - проверьте права токенов"
+  ]
+}

@@ -1,6 +1,6 @@
 # app/models/message.py
 from pydantic import BaseModel, Field, validator
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 import re
 import signal
@@ -74,8 +74,37 @@ def safe_regex_sub(pattern: str, replacement: str, text: str, timeout_seconds: i
         # При любой другой ошибке возвращаем исходный текст
         return text
 
+def normalize_datetime(dt: datetime) -> datetime:
+    """Normalize datetime to UTC with timezone info"""
+    if dt is None:
+        return datetime.now(timezone.utc)
+    
+    # If datetime is naive (no timezone), assume UTC
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    
+    # If datetime has timezone, convert to UTC
+    return dt.astimezone(timezone.utc)
+
+def parse_discord_timestamp(timestamp_str: str) -> datetime:
+    """Parse Discord timestamp string with proper timezone handling"""
+    try:
+        # Discord timestamps are in ISO format, sometimes with 'Z' suffix
+        if timestamp_str.endswith('Z'):
+            timestamp_str = timestamp_str[:-1] + '+00:00'
+        
+        # Parse the timestamp
+        dt = datetime.fromisoformat(timestamp_str)
+        
+        # Ensure it has timezone info
+        return normalize_datetime(dt)
+        
+    except Exception as e:
+        # Fallback to current UTC time if parsing fails
+        return datetime.now(timezone.utc)
+
 class DiscordMessage(BaseModel):
-    """Typed Discord message model with validation"""
+    """Typed Discord message model with validation and proper timezone handling"""
     
     content: str = Field(..., min_length=1, max_length=4000)
     timestamp: datetime
@@ -119,11 +148,37 @@ class DiscordMessage(BaseModel):
         
         return v
     
-    @validator('timestamp')
+    @validator('timestamp', pre=True)
     def validate_timestamp(cls, v):
-        """Ensure timestamp is not in the future"""
-        if v > datetime.now():
-            raise ValueError('Message timestamp cannot be in the future')
+        """Ensure timestamp has proper timezone and is not in the future"""
+        if isinstance(v, str):
+            v = parse_discord_timestamp(v)
+        elif isinstance(v, datetime):
+            v = normalize_datetime(v)
+        
+        # Convert to UTC for comparison
+        now_utc = datetime.now(timezone.utc)
+        v_utc = normalize_datetime(v)
+        
+        # Allow some tolerance for clock skew (5 minutes)
+        tolerance = 300  # 5 minutes in seconds
+        if (v_utc - now_utc).total_seconds() > tolerance:
+            # If timestamp is too far in the future, use current time
+            v = now_utc
+        
+        return v
+    
+    @validator('processed_at', pre=True)
+    def validate_processed_at(cls, v):
+        """Ensure processed_at has proper timezone"""
+        if v is None:
+            return None
+        
+        if isinstance(v, str):
+            v = parse_discord_timestamp(v)
+        elif isinstance(v, datetime):
+            v = normalize_datetime(v)
+        
         return v
     
     @validator('server_name', 'channel_name', 'author', pre=True)
@@ -159,7 +214,9 @@ class DiscordMessage(BaseModel):
         parts.append(f"📢 #{self.channel_name}")
         
         if show_timestamp:
-            parts.append(f"📅 {self.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+            # Format timestamp in a readable way
+            formatted_time = self.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')
+            parts.append(f"📅 {formatted_time}")
         
         parts.append(f"👤 {self.author}")
         parts.append(f"💬 {self.content}")
@@ -169,14 +226,17 @@ class DiscordMessage(BaseModel):
     class Config:
         # Allow datetime to be set from various formats
         json_encoders = {
-            datetime: lambda v: v.isoformat()
+            datetime: lambda v: v.isoformat() if v else None
         }
+        
+        # Use enum values
+        use_enum_values = True
         
         # Example for JSON schema generation
         json_schema_extra = {
             "example": {
                 "content": "🎉 New feature released!",
-                "timestamp": "2024-01-15T12:00:00",
+                "timestamp": "2024-01-15T12:00:00+00:00",
                 "server_name": "My Discord Server",
                 "channel_name": "announcements",
                 "author": "ServerBot",
