@@ -1,16 +1,17 @@
-# app/config.py
+# app/config.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from typing import List, Dict, Optional
 from functools import lru_cache
 import os
+import logging
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 class Settings(BaseSettings):
-    """Application settings with validation for 35-50 channels"""
+    """Application settings with validation for flexible channel limits"""
     
     # Application Settings
     app_name: str = "Discord Telegram Parser MVP"
@@ -35,19 +36,19 @@ class Settings(BaseSettings):
     # Server/Channel Mappings (will be populated dynamically)
     server_channel_mappings: Dict[str, Dict[str, str]] = Field(default_factory=dict)
     
-    # Performance Limits for MVP (35-50 channels)
-    max_channels_per_server: int = Field(default=10, ge=1, le=20)
-    max_total_channels: int = Field(default=50, ge=10, le=100)
-    max_servers: int = Field(default=10, ge=1, le=15)
+    # ИСПРАВЛЕНО: Более гибкие лимиты 
+    max_channels_per_server: int = Field(default=5, ge=1, le=20, env="MAX_CHANNELS_PER_SERVER")
+    max_total_channels: int = Field(default=100, ge=10, le=500, env="MAX_TOTAL_CHANNELS")  # Снижен минимум до 10
+    max_servers: int = Field(default=50, ge=5, le=100, env="MAX_SERVERS")  # Снижен минимум до 5
     
     # Rate Limiting
-    discord_rate_limit_per_second: float = Field(default=2.0, ge=0.5, le=10.0)
-    telegram_rate_limit_per_minute: int = Field(default=20, ge=5, le=100)
+    discord_rate_limit_per_second: float = Field(default=1.5, ge=0.5, le=5.0, env="DISCORD_RATE_LIMIT_PER_SECOND")
+    telegram_rate_limit_per_minute: int = Field(default=30, ge=5, le=100, env="TELEGRAM_RATE_LIMIT_PER_MINUTE")
     
     # Message Processing
     max_message_length: int = Field(default=4000, ge=1000, le=4096)
-    message_batch_size: int = Field(default=10, ge=1, le=50)
-    max_history_messages: int = Field(default=100, ge=10, le=500)
+    message_batch_size: int = Field(default=5, ge=1, le=20)
+    max_history_messages: int = Field(default=50, ge=5, le=200)  # Снижен минимум
     
     # Message TTL for deduplication
     message_ttl_seconds: int = Field(
@@ -58,13 +59,13 @@ class Settings(BaseSettings):
     )
     
     # WebSocket Configuration
-    websocket_heartbeat_interval: int = Field(default=41250, ge=30000)
-    websocket_reconnect_delay: int = Field(default=30, ge=5, le=300)
-    websocket_max_retries: int = Field(default=5, ge=1, le=10)
+    websocket_heartbeat_interval: int = Field(default=45000, ge=30000)
+    websocket_reconnect_delay: int = Field(default=60, ge=5, le=300)
+    websocket_max_retries: int = Field(default=3, ge=1, le=10)
     
     # Memory Management
-    cleanup_interval_minutes: int = Field(default=5, ge=1, le=60)
-    max_memory_mb: int = Field(default=2048, ge=512, le=8192)
+    cleanup_interval_minutes: int = Field(default=10, ge=1, le=60)
+    max_memory_mb: int = Field(default=4096, ge=512, le=8192)
     
     # Telegram UI Preferences
     use_topics: bool = Field(default=True, env="TELEGRAM_USE_TOPICS")
@@ -78,10 +79,15 @@ class Settings(BaseSettings):
     
     # Redis Configuration (for caching)
     redis_url: Optional[str] = Field(default=None, env="REDIS_URL")
-    cache_ttl_seconds: int = Field(default=300, ge=60, le=3600)
+    cache_ttl_seconds: int = Field(default=600, ge=60, le=3600)
     
     # Health Check Configuration
-    health_check_interval: int = Field(default=60, ge=10, le=300)
+    health_check_interval: int = Field(default=120, ge=30, le=300)
+    
+    # НОВОЕ: Специальные настройки для большого количества серверов
+    max_concurrent_server_processing: int = Field(default=5, ge=1, le=20, env="MAX_CONCURRENT_SERVER_PROCESSING")
+    server_discovery_batch_size: int = Field(default=10, ge=5, le=25, env="SERVER_DISCOVERY_BATCH_SIZE")
+    channel_test_timeout: int = Field(default=5, ge=2, le=15, env="CHANNEL_TEST_TIMEOUT")
     
     @field_validator('discord_auth_tokens')
     @classmethod
@@ -112,17 +118,29 @@ class Settings(BaseSettings):
     @field_validator('max_total_channels')
     @classmethod
     def validate_channel_limits(cls, v, info):
-        """Validate channel limits"""
+        """ИСПРАВЛЕНО: Более гибкая валидация лимитов каналов"""
         if info.data:
-            max_per_server = info.data.get('max_channels_per_server', 10)
-            max_servers = info.data.get('max_servers', 10)
+            max_per_server = info.data.get('max_channels_per_server', 5)
+            max_servers = info.data.get('max_servers', 50)
             
             theoretical_max = max_per_server * max_servers
-            if v > theoretical_max:
-                raise ValueError(
-                    f'max_total_channels ({v}) cannot exceed '
-                    f'max_channels_per_server * max_servers ({theoretical_max})'
+            
+            # Предупреждаем, но не блокируем, если лимит слишком низкий
+            if v < max_per_server:
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f'max_total_channels ({v}) is less than max_channels_per_server ({max_per_server}). '
+                    f'This may limit functionality.'
                 )
+            
+            # Предупреждаем, если лимит намного превышает теоретический максимум
+            if v > theoretical_max * 2:
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    f'max_total_channels ({v}) is much higher than theoretical max ({theoretical_max}). '
+                    f'Consider adjusting server or per-server limits.'
+                )
+        
         return v
     
     @property
@@ -134,6 +152,13 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """Check if running in production mode"""
         return not self.debug
+    
+    @property
+    def effective_max_servers(self) -> int:
+        """Calculate effective max servers based on channel limits"""
+        if self.max_channels_per_server > 0:
+            return min(self.max_servers, self.max_total_channels // self.max_channels_per_server)
+        return self.max_servers
     
     @property
     def log_config(self) -> dict:
