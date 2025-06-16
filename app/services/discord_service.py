@@ -1,9 +1,9 @@
-# app/services/discord_service.py - IMPROVED VERSION
+# app/services/discord_service.py - FIXED VERSION
 import aiohttp
 import asyncio
 import json
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Callable
 import structlog
 import random
 
@@ -13,7 +13,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class DiscordService:
-    """Improved Discord service with better error handling and rate limiting"""
+    """Fixed Discord service with message callback support"""
     
     def __init__(self, 
                  settings: Settings,
@@ -34,6 +34,10 @@ class DiscordService:
         self.servers: Dict[str, ServerInfo] = {}
         self.websocket_connections: List[aiohttp.ClientWebSocketResponse] = []
         
+        # FIXED: Initialize message callbacks and monitoring
+        self.message_callbacks: List[Callable] = []
+        self.monitored_channels: Set[str] = set()
+        
         # State
         self.running = False
         self._initialization_done = False
@@ -46,6 +50,28 @@ class DiscordService:
         self.max_retries = 3
         self.base_delay = 1.0
         self.max_delay = 60.0
+    
+    def add_message_callback(self, callback: Callable):
+        """Add callback for real-time messages"""
+        self.message_callbacks.append(callback)
+        self.logger.info("Message callback added", callback_count=len(self.message_callbacks))
+    
+    def remove_message_callback(self, callback: Callable):
+        """Remove message callback"""
+        if callback in self.message_callbacks:
+            self.message_callbacks.remove(callback)
+            self.logger.info("Message callback removed", callback_count=len(self.message_callbacks))
+    
+    async def _trigger_message_callbacks(self, message: DiscordMessage):
+        """Trigger all registered message callbacks"""
+        for callback in self.message_callbacks:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    await callback(message)
+                else:
+                    callback(message)
+            except Exception as e:
+                self.logger.error("Error in message callback", error=str(e))
     
     async def initialize(self) -> bool:
         """Initialize Discord service with improved token validation"""
@@ -308,6 +334,10 @@ class DiscordService:
                         channel_info.last_checked = datetime.now()
                         
                         server_info.add_channel(channel_info)
+                        
+                        # Add to monitored channels for callback triggering
+                        if channel_info.http_accessible:
+                            self.monitored_channels.add(channel['id'])
                     
                     # Update server stats and status
                     server_info.update_stats()
@@ -381,8 +411,7 @@ class DiscordService:
             
             # Look for announcement-related names
             announcement_keywords = [
-                'announcement', 'announcements', 'announce', 'news', 
-                'updates', 'general', 'important', 'notice'
+                'announcement', 'announcements', 'announce'
             ]
             
             if any(keyword in channel_name for keyword in announcement_keywords):
@@ -611,7 +640,7 @@ class DiscordService:
                 await asyncio.sleep(error_delay)
     
     async def _poll_channel_safely(self, server_name: str, channel_id: str) -> bool:
-        """Poll a single channel safely"""
+        """Poll a single channel safely and trigger callbacks for new messages"""
         try:
             messages = await self.get_recent_messages(server_name, channel_id, limit=3)
             
@@ -621,8 +650,9 @@ class DiscordService:
                                 channel_id=channel_id,
                                 message_count=len(messages))
                 
-                # Here you would typically queue these messages for processing
-                # This would be connected to the MessageProcessor
+                # Trigger callbacks for each message
+                for message in messages:
+                    await self._trigger_message_callbacks(message)
             
             return True
             
@@ -641,6 +671,8 @@ class DiscordService:
             "total_channels": sum(s.channel_count for s in self.servers.values()),
             "accessible_channels": sum(s.accessible_channel_count for s in self.servers.values()),
             "valid_sessions": len(self.sessions),
+            "monitored_channels": len(self.monitored_channels),
+            "message_callbacks": len(self.message_callbacks),
             "servers": {name: {
                 "status": server.status.value,
                 "channels": server.channel_count,

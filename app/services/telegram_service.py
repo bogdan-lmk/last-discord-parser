@@ -1,7 +1,7 @@
-# app/services/telegram_service.py
+# app/services/telegram_service.py - ИСПРАВЛЕНИЕ ИМПОРТОВ
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta  # ИСПРАВЛЕНО: добавлен timedelta
 from typing import Dict, List, Optional, Callable
 from threading import Lock
 import structlog
@@ -14,7 +14,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class TelegramService:
-    """Clean Telegram service with dependency injection and proper error handling"""
+    """ИСПРАВЛЕННЫЙ Telegram service с правильной логикой топиков"""
     
     def __init__(self, 
                  settings: Settings,
@@ -33,8 +33,8 @@ class TelegramService:
             threaded=True
         )
         
-        # State management
-        self.server_topics: Dict[str, int] = {}  # server_name -> topic_id
+        # ИСПРАВЛЕНИЕ: Правильное управление топиками
+        self.server_topics: Dict[str, int] = {}  # server_name -> topic_id (ОДИН топик на сервер)
         self._async_lock = asyncio.Lock()
         self.user_states: Dict[int, dict] = {}  # user_id -> state
         
@@ -47,11 +47,16 @@ class TelegramService:
         # Bot running state
         self.bot_running = False
         
-        # ИСПРАВЛЕНИЕ: Добавляем кэш для проверки существования топиков
+        # ИСПРАВЛЕНИЕ: Кэш проверки топиков с блокировкой дублирования
         self._topic_verification_cache: Dict[int, bool] = {}
+        self._topic_creation_lock: Dict[str, asyncio.Lock] = {}  # server_name -> lock
         self._topic_cache_timeout = 300  # 5 минут
         self._last_cache_clear = datetime.now()
         
+        # ИСПРАВЛЕНИЕ: Дедупликация сообщений
+        self._processed_messages: Dict[str, datetime] = {}  # message_id -> timestamp
+        self._message_dedup_lock = asyncio.Lock()
+    
     async def initialize(self) -> bool:
         """Initialize Telegram service"""
         try:
@@ -170,28 +175,44 @@ class TelegramService:
             self.logger.error("Failed to save persistent data", error=str(e))
     
     async def send_message(self, message: DiscordMessage) -> bool:
-        """Send a Discord message to Telegram"""
+        """ИСПРАВЛЕНО: Send a Discord message to Telegram (с дедупликацией)"""
         try:
+            # ИСПРАВЛЕНИЕ: Проверяем дубли сообщений
+            if await self._is_duplicate_message(message):
+                self.logger.debug("Duplicate message ignored", 
+                               server=message.server_name,
+                               message_id=message.message_id)
+                return True  # Считаем успешным, но не отправляем
+            
             await self.rate_limiter.wait_if_needed("telegram_send")
             
-            # ИСПРАВЛЕНИЕ: Получаем или создаем топик только ОДИН раз для сервера
+            # ИСПРАВЛЕНИЕ: Получаем топик ТОЛЬКО ОДИН РАЗ для сервера
             topic_id = await self._get_or_create_server_topic(message.server_name)
+            
+            if topic_id is None and self.settings.use_topics:
+                self.logger.error("Failed to get topic for server", server=message.server_name)
+                return False
             
             # Format message
             formatted_message = self._format_message_for_telegram(message)
             
-            # Send message
+            # ИСПРАВЛЕНИЕ: Убираем Markdown для безопасности
             sent_message = self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
                 text=formatted_message,
                 message_thread_id=topic_id if self.settings.use_topics else None,
-                parse_mode='Markdown'
+                parse_mode=None  # ИСПРАВЛЕНО: убираем Markdown
             )
             
             # Track message
             if sent_message:
                 self.message_mappings[str(message.timestamp)] = sent_message.message_id
-                await self._save_persistent_data()
+                
+                # ИСПРАВЛЕНИЕ: Отмечаем сообщение как обработанное
+                await self._mark_message_as_processed(message)
+                
+                # Сохраняем данные
+                asyncio.create_task(self._save_persistent_data())
                 
                 self.logger.info("Message sent to Telegram", 
                                server=message.server_name,
@@ -211,11 +232,37 @@ class TelegramService:
         
         return False
     
+    async def _is_duplicate_message(self, message: DiscordMessage) -> bool:
+        """ИСПРАВЛЕНИЕ: Проверка дублирования сообщений"""
+        async with self._message_dedup_lock:
+            message_key = f"{message.guild_id}:{message.channel_id}:{message.message_id}"
+            
+            # Очищаем старые записи (старше 1 часа)
+            cutoff_time = datetime.now() - timedelta(hours=1)
+            old_keys = [
+                key for key, timestamp in self._processed_messages.items()
+                if timestamp < cutoff_time
+            ]
+            for key in old_keys:
+                del self._processed_messages[key]
+            
+            # Проверяем дубли
+            if message_key in self._processed_messages:
+                return True
+            
+            return False
+    
+    async def _mark_message_as_processed(self, message: DiscordMessage) -> None:
+        """ИСПРАВЛЕНИЕ: Отмечаем сообщение как обработанное"""
+        async with self._message_dedup_lock:
+            message_key = f"{message.guild_id}:{message.channel_id}:{message.message_id}"
+            self._processed_messages[message_key] = datetime.now()
+    
     def _format_message_for_telegram(self, message: DiscordMessage) -> str:
-        """Format Discord message for Telegram with server-specific formatting"""
+        """ИСПРАВЛЕНО: Format Discord message for Telegram без Markdown"""
         parts = []
         
-        # Показываем канал (поскольку сервер уже понятен из топика)
+        # ИСПРАВЛЕНИЕ: Простое форматирование без Markdown
         parts.append(f"📢 #{message.channel_name}")
         
         if self.settings.show_timestamps:
@@ -225,13 +272,12 @@ class TelegramService:
         parts.append(f"💬 {message.content}")
         
         return "\n".join(parts)
-    
     async def send_messages_batch(self, messages: List[DiscordMessage]) -> int:
-        """Send multiple messages as a batch"""
+        """ИСПРАВЛЕНО: Send multiple messages as a batch"""
         if not messages:
             return 0
         
-        # Group messages by server
+        # ИСПРАВЛЕНИЕ: Группируем по серверам для правильного распределения по топикам
         server_groups = {}
         for message in messages:
             server_name = message.server_name
@@ -253,7 +299,11 @@ class TelegramService:
             # ИСПРАВЛЕНИЕ: Получаем топик ОДИН раз для всех сообщений сервера
             topic_id = await self._get_or_create_server_topic(server_name)
             
-            # Send each message to the same topic
+            if topic_id is None and self.settings.use_topics:
+                self.logger.error("Failed to get topic for server batch", server=server_name)
+                continue
+            
+            # Send each message to the SAME topic
             for message in server_messages:
                 if await self._send_message_to_topic(message, topic_id):
                     sent_count += 1
@@ -270,22 +320,33 @@ class TelegramService:
     async def _send_message_to_topic(self, message: DiscordMessage, topic_id: Optional[int]) -> bool:
         """Send message to specific topic (helper method)"""
         try:
+            # ИСПРАВЛЕНИЕ: Проверяем дубли
+            if await self._is_duplicate_message(message):
+                self.logger.debug("Duplicate message in batch ignored", 
+                               server=message.server_name,
+                               message_id=message.message_id)
+                return True
+            
             await self.rate_limiter.wait_if_needed("telegram_send")
             
             # Format message
             formatted_message = self._format_message_for_telegram(message)
             
-            # Send message
+            # Send message без Markdown
             sent_message = self.bot.send_message(
                 chat_id=self.settings.telegram_chat_id,
                 text=formatted_message,
                 message_thread_id=topic_id if self.settings.use_topics else None,
-                parse_mode='Markdown'
+                parse_mode=None
             )
             
             # Track message
             if sent_message:
                 self.message_mappings[str(message.timestamp)] = sent_message.message_id
+                
+                # Отмечаем как обработанное
+                await self._mark_message_as_processed(message)
+                
                 self.rate_limiter.record_success()
                 return True
             
@@ -300,15 +361,19 @@ class TelegramService:
         return False
     
     async def _get_or_create_server_topic(self, server_name: str) -> Optional[int]:
-        """ИСПРАВЛЕНО: Получить или создать топик для сервера (БЕЗ дублирования)"""
+        """КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Получить или создать топик для сервера (БЕЗ дублирования!)"""
         if not self.settings.use_topics:
             return None
         
-        async with self._async_lock:
+        # ИСПРАВЛЕНИЕ: Блокировка по серверу для предотвращения дублирования
+        if server_name not in self._topic_creation_lock:
+            self._topic_creation_lock[server_name] = asyncio.Lock()
+        
+        async with self._topic_creation_lock[server_name]:
             # Очистка кэша если нужно
             await self._clear_topic_cache_if_needed()
             
-            # Проверяем существующий топик в кэше
+            # ИСПРАВЛЕНИЕ: Проверяем существующий топик
             if server_name in self.server_topics:
                 topic_id = self.server_topics[server_name]
                 
@@ -327,10 +392,20 @@ class TelegramService:
                     if topic_id in self._topic_verification_cache:
                         del self._topic_verification_cache[topic_id]
             
-            # Создаем новый топик только если его нет
+            # ИСПРАВЛЕНИЕ: Проверяем еще раз - может другой поток уже создал
+            if server_name in self.server_topics:
+                topic_id = self.server_topics[server_name]
+                if await self._verify_topic_exists_cached(topic_id):
+                    self.logger.debug("Topic created by another thread", 
+                                    server=server_name, 
+                                    topic_id=topic_id)
+                    return topic_id
+            
+            # Создаем новый топик только если его действительно нет
             try:
                 self.logger.info("Creating new topic for server", server=server_name)
                 
+                # ИСПРАВЛЕНИЕ: Упрощаем создание топика
                 topic = self.bot.create_forum_topic(
                     chat_id=self.settings.telegram_chat_id,
                     name=f"🏰 {server_name}",
@@ -339,11 +414,11 @@ class TelegramService:
                 
                 topic_id = topic.message_thread_id
                 
-                # Сохраняем в кэш
+                # ИСПРАВЛЕНИЕ: Атомарно сохраняем в кэш
                 self.server_topics[server_name] = topic_id
                 self._topic_verification_cache[topic_id] = True
                 
-                # Сохраняем в persistent storage
+                # Сохраняем в persistent storage асинхронно
                 asyncio.create_task(self._save_persistent_data())
                 
                 self.logger.info("Created new topic successfully", 
@@ -383,6 +458,7 @@ class TelegramService:
     async def _verify_topic_exists(self, topic_id: int) -> bool:
         """Verify that a topic still exists"""
         try:
+            # ИСПРАВЛЕНИЕ: Упрощаем проверку
             self.bot.get_forum_topic(
                 chat_id=self.settings.telegram_chat_id,
                 message_thread_id=topic_id
@@ -401,56 +477,25 @@ class TelegramService:
         def send_welcome(message):
             """Welcome message with status"""
             text = (
-                f"🤖 **{self.settings.app_name} v{self.settings.app_version}**\n\n"
-                f"🔥 **Features:**\n"
-                f"• Real-time Discord monitoring\n"
-                f"• Smart topic management (1 server = 1 topic)\n" 
-                f"• Rate limiting protection\n"
-                f"• Professional error handling\n\n"
-                f"📊 **Current Status:**\n"
+                f"🤖 {self.settings.app_name} v{self.settings.app_version}\n\n"
+                f"🔥 ИСПРАВЛЕННАЯ версия:\n"
+                f"• 1 Discord Server = 1 Telegram Topic\n"
+                f"• Только announcement каналы\n"
+                f"• Дедупликация сообщений\n\n"
+                f"📊 Статус:\n"
                 f"• Server topics: {len(self.server_topics)}\n"
                 f"• Messages processed: {len(self.message_mappings)}\n"
-                f"• Rate limiter: {self.rate_limiter.name}\n\n"
-                f"Use the buttons below to interact:"
+                f"• Cache: {len(self._processed_messages)}\n\n"
+                f"Команды: /status /list_topics /clean_topics"
             )
             
-            markup = InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                InlineKeyboardButton("📊 Status", callback_data="status"),
-                InlineKeyboardButton("📋 Servers", callback_data="servers"),
-                InlineKeyboardButton("🔧 Settings", callback_data="settings"),
-                InlineKeyboardButton("❓ Help", callback_data="help")
-            )
-            
-            self.bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode='Markdown')
-        
-        @self.bot.callback_query_handler(func=lambda call: True)
-        def handle_callback_query(call):
-            """Handle callback queries"""
-            try:
-                data = call.data
-                self.logger.info("Callback received", data=data, user_id=call.from_user.id)
-                
-                if data == "status":
-                    self._handle_status_callback(call)
-                elif data == "servers":
-                    self._handle_servers_callback(call)
-                elif data == "settings":
-                    self._handle_settings_callback(call)
-                elif data == "help":
-                    self._handle_help_callback(call)
-                else:
-                    self.bot.answer_callback_query(call.id, "Unknown command")
-                    
-            except Exception as e:
-                self.logger.error("Error handling callback", error=str(e))
-                self.bot.answer_callback_query(call.id, "Error occurred")
+            self.bot.send_message(message.chat.id, text)
         
         @self.bot.message_handler(commands=['status'])
         def status_command(message):
             """Show detailed status"""
             status_text = self._get_status_text()
-            self.bot.send_message(message.chat.id, status_text, parse_mode='Markdown')
+            self.bot.send_message(message.chat.id, status_text)
         
         @self.bot.message_handler(commands=['clean_topics'])
         def clean_topics_command(message):
@@ -469,133 +514,44 @@ class TelegramService:
                 self.bot.send_message(message.chat.id, "❌ No server topics found.")
                 return
             
-            text = f"📋 **Server Topics** ({len(self.server_topics)}):\n\n"
+            text = f"📋 Server Topics ({len(self.server_topics)}):\n\n"
             for server_name, topic_id in self.server_topics.items():
                 text += f"• {server_name} → Topic {topic_id}\n"
             
-            self.bot.send_message(message.chat.id, text, parse_mode='Markdown')
-    
-    def _handle_status_callback(self, call):
-        """Handle status callback"""
-        status_text = self._get_status_text()
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="start"))
+            self.bot.send_message(message.chat.id, text)
         
-        self.bot.edit_message_text(
-            status_text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-        self.bot.answer_callback_query(call.id)
-    
-    def _handle_servers_callback(self, call):
-        """Handle servers callback"""
-        if not self.server_topics:
-            text = "❌ No servers configured yet."
-        else:
-            text = f"📋 **Configured Servers** ({len(self.server_topics)}):\n\n"
-            for server_name, topic_id in self.server_topics.items():
-                # Не проверяем существование при каждом вызове - слишком дорого
-                text += f"• **{server_name}**\n  └ Topic ID: {topic_id}\n\n"
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="start"))
-        
-        self.bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-        self.bot.answer_callback_query(call.id)
-    
-    def _handle_settings_callback(self, call):
-        """Handle settings callback"""
-        text = (
-            f"⚙️ **Current Settings:**\n\n"
-            f"• Use topics: {self.settings.use_topics}\n"
-            f"• Show timestamps: {self.settings.show_timestamps}\n"
-            f"• Show server in message: {self.settings.show_server_in_message}\n"
-            f"• Max channels per server: {self.settings.max_channels_per_server}\n"
-            f"• Max total channels: {self.settings.max_total_channels}\n"
-            f"• Rate limit (Telegram): {self.settings.telegram_rate_limit_per_minute}/min\n\n"
-            f"📝 **Topic Logic:**\n"
-            f"• 1 Discord Server = 1 Telegram Topic\n"
-            f"• All channels from server go to same topic\n"
-            f"• Topics are cached and persistent\n"
-        )
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="start"))
-        
-        self.bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-        self.bot.answer_callback_query(call.id)
-    
-    def _handle_help_callback(self, call):
-        """Handle help callback"""
-        text = (
-            f"❓ **Help & Commands:**\n\n"
-            f"**Bot Commands:**\n"
-            f"• `/start` - Show main menu\n"
-            f"• `/status` - Show detailed status\n"
-            f"• `/clean_topics` - Clean invalid topics\n"
-            f"• `/list_topics` - List all server topics\n\n"
-            f"**Features:**\n"
-            f"• **One Topic Per Server** - Each Discord server gets exactly one Telegram topic\n"
-            f"• All channels from a server post to the same topic\n"
-            f"• Automatic topic creation and management\n"
-            f"• Real-time message forwarding\n"
-            f"• Rate limiting protection\n"
-            f"• Error recovery and retry logic\n"
-            f"• Persistent state management\n\n"
-            f"**Support:**\n"
-            f"• Check logs for detailed information\n"
-            f"• Topics are automatically managed\n"
-            f"• Bot recovers from temporary failures\n"
-        )
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="start"))
-        
-        self.bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-        self.bot.answer_callback_query(call.id)
+        @self.bot.message_handler(commands=['debug'])
+        def debug_command(message):
+            """Debug information"""
+            debug_text = (
+                f"🔧 Debug Info:\n"
+                f"• Topics: {len(self.server_topics)}\n"
+                f"• Locks: {len(self._topic_creation_lock)}\n"
+                f"• Cache: {len(self._topic_verification_cache)}\n"
+                f"• Messages: {len(self._processed_messages)}\n"
+                f"• Bot running: {self.bot_running}\n"
+                f"• Use topics: {self.settings.use_topics}\n"
+                f"• Chat ID: {self.settings.telegram_chat_id}"
+            )
+            self.bot.send_message(message.chat.id, debug_text)
     
     def _get_status_text(self) -> str:
         """Get formatted status text"""
         rate_stats = self.rate_limiter.get_stats()
         
         return (
-            f"📊 **Telegram Service Status:**\n\n"
-            f"**Server Topics (1 server = 1 topic):**\n"
-            f"• Active server topics: {len(self.server_topics)}\n"
-            f"• Topics enabled: {self.settings.use_topics}\n"
+            f"📊 Telegram Service Status:\n\n"
+            f"Server Topics (1:1):\n"
+            f"• Active topics: {len(self.server_topics)}\n"
+            f"• Creation locks: {len(self._topic_creation_lock)}\n"
             f"• Cache size: {len(self._topic_verification_cache)}\n\n"
-            f"**Messages:**\n"
-            f"• Messages tracked: {len(self.message_mappings)}\n"
-            f"• Show timestamps: {self.settings.show_timestamps}\n\n"
-            f"**Rate Limiting:**\n"
+            f"Message Deduplication:\n"
+            f"• Processed: {len(self._processed_messages)}\n"
+            f"• Tracked: {len(self.message_mappings)}\n\n"
+            f"Rate Limiting:\n"
             f"• Limit: {self.settings.telegram_rate_limit_per_minute}/min\n"
-            f"• Success rate: {rate_stats.get('success_count', 0)}\n"
-            f"• Error count: {rate_stats.get('error_count', 0)}\n"
-            f"• Adaptive multiplier: {rate_stats.get('adaptive_multiplier', 1.0):.2f}\n\n"
-            f"**Storage:**\n"
-            f"• Redis: {'✅' if self.redis_client else '❌'}\n"
-            f"• Cache TTL: {self.settings.cache_ttl_seconds}s\n"
+            f"• Success: {rate_stats.get('success_count', 0)}\n"
+            f"• Errors: {rate_stats.get('error_count', 0)}\n"
         )
     
     async def _clean_invalid_topics(self) -> int:
@@ -619,6 +575,10 @@ class TelegramService:
             # Также очищаем из кэша верификации
             if topic_id in self._topic_verification_cache:
                 del self._topic_verification_cache[topic_id]
+            
+            # Очищаем блокировку
+            if server_name in self._topic_creation_lock:
+                del self._topic_creation_lock[server_name]
             
             self.logger.info("Removed invalid topic", 
                            server=server_name,
@@ -645,7 +605,7 @@ class TelegramService:
         self.setup_bot_handlers()
         self.bot_running = True
         
-        self.logger.info("Starting Telegram bot", 
+        self.logger.info("Starting ИСПРАВЛЕННЫЙ Telegram bot", 
                        chat_id=self.settings.telegram_chat_id,
                        use_topics=self.settings.use_topics,
                        server_topics=len(self.server_topics))
@@ -665,7 +625,7 @@ class TelegramService:
             self.logger.error("Bot polling error", error=str(e))
         finally:
             self.bot_running = False
-            self.logger.info("Telegram bot stopped")
+            self.logger.info("ИСПРАВЛЕННЫЙ Telegram bot stopped")
     
     def stop_bot(self) -> None:
         """Stop the Telegram bot"""
@@ -682,5 +642,13 @@ class TelegramService:
         """Clean up resources"""
         self.stop_bot()
         await self._save_persistent_data()
-        self.logger.info("Telegram service cleaned up",
+        
+        # Очистка кэшей
+        async with self._message_dedup_lock:
+            self._processed_messages.clear()
+        
+        self._topic_verification_cache.clear()
+        self._topic_creation_lock.clear()
+        
+        self.logger.info("ИСПРАВЛЕННЫЙ Telegram service cleaned up",
                         final_topics=len(self.server_topics))
