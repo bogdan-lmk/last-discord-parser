@@ -754,10 +754,24 @@ class MessageProcessor:
             self.logger.error("Error updating stats", error=str(e))
     
     def get_status(self) -> Dict[str, any]:
-        """Get comprehensive system status"""
+        """Get comprehensive system status with enhanced features"""
         discord_stats = self.discord_service.get_server_stats()
         
-        # Calculate announcement channel statistics
+        # НОВОЕ: Добавляем enhanced статистики Telegram
+        enhanced_features = {}
+        try:
+            enhanced_stats = self.telegram_service.get_enhanced_stats()
+            enhanced_features = {
+                "telegram_enhanced": enhanced_stats,
+                "anti_duplicate_active": self.telegram_service.startup_verification_done,
+                "bot_interface_active": self.telegram_service.bot_running,
+                "user_states_count": len(getattr(self.telegram_service, 'user_states', {})),
+                "processed_messages_cache": len(getattr(self.telegram_service, 'processed_messages', {}))
+            }
+        except Exception as e:
+            enhanced_features = {"error": str(e), "available": False}
+        
+        # Подсчет announcement каналов
         announcement_channels = 0
         for server_info in self.discord_service.servers.values():
             for channel_info in server_info.accessible_channels.values():
@@ -772,7 +786,7 @@ class MessageProcessor:
                 "health_score": self.stats.health_score,
                 "status": self.stats.status,
                 "realtime_enabled": self.realtime_enabled,
-                "version": "ИСПРАВЛЕННАЯ версия с дедупликацией"
+                "version": "Enhanced версия с bot interface"  # ОБНОВЛЕНО
             },
             "discord": {
                 **discord_stats,
@@ -783,7 +797,8 @@ class MessageProcessor:
                 "topics": len(self.telegram_service.server_topics),
                 "bot_running": self.telegram_service.bot_running,
                 "messages_tracked": len(self.telegram_service.message_mappings),
-                "one_topic_per_server": True
+                "one_topic_per_server": True,
+                "enhanced_interface": True  # НОВОЕ
             },
             "processing": {
                 "queue_size": self.message_queue.qsize(),
@@ -800,6 +815,7 @@ class MessageProcessor:
                 "discord": self.discord_service.rate_limiter.get_stats(),
                 "telegram": self.telegram_service.rate_limiter.get_stats()
             },
+            "enhanced_features": enhanced_features,  # НОВОЕ
             "servers": {
                 server_name: {
                     "message_count": self.server_message_counts.get(server_name, 0),
@@ -811,12 +827,5 @@ class MessageProcessor:
                     ]) if server_name in self.discord_service.servers else 0
                 }
                 for server_name in self.discord_service.servers.keys()
-            },
-            "improvements": {
-                "enhanced_deduplication": True,
-                "announcement_filtering": True,
-                "atomic_topic_creation": True,
-                "rate_limit_optimization": True,
-                "memory_efficient": True
             }
         }

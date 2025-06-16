@@ -30,6 +30,8 @@ class DiscordService:
         self.current_token_index = 0
         self.token_failure_counts: Dict[int, int] = {}
         
+        self.telegram_service_ref = None  # Reference to Telegram service for cross-service communication
+        
         # Server tracking
         self.servers: Dict[str, ServerInfo] = {}
         self.websocket_connections: List[aiohttp.ClientWebSocketResponse] = []
@@ -361,6 +363,7 @@ class DiscordService:
                 
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.base_delay * (2 ** attempt))
+                    
     
     async def _test_channel_access_with_retry(self, session: aiohttp.ClientSession, channel_id: str) -> bool:
         """Test channel access with retry logic"""
@@ -540,6 +543,73 @@ class DiscordService:
                 self.rate_limiter.record_error()
         
         return []
+    
+    def set_telegram_service_ref(self, telegram_service):
+        """Set reference to Telegram service for integration"""
+        self.telegram_service_ref = telegram_service
+        self.logger.info("Telegram service reference set for Discord integration")
+    
+    def notify_new_channel_added(self, server_name: str, channel_id: str, channel_name: str):
+        """Notify about new channel addition through bot interface"""
+        try:
+            if server_name in self.servers:
+                server_info = self.servers[server_name]
+                
+                # Создаем новый ChannelInfo
+                from ..models.server import ChannelInfo
+                channel_info = ChannelInfo(
+                    channel_id=channel_id,
+                    channel_name=channel_name
+                )
+                
+                # Тестируем доступность канала
+                asyncio.create_task(self._test_and_add_channel(server_info, channel_info))
+                
+                self.logger.info("Channel addition initiated through bot interface",
+                               server=server_name,
+                               channel_id=channel_id,
+                               channel_name=channel_name)
+                
+                return True
+            else:
+                self.logger.warning("Server not found for channel addition", server=server_name)
+                return False
+                
+        except Exception as e:
+            self.logger.error("Error notifying about new channel", error=str(e))
+            return False
+    
+    async def _test_and_add_channel(self, server_info, channel_info):
+        """Test channel accessibility and add to monitoring"""
+        try:
+            # Тестируем доступность канала
+            if self.sessions:
+                session = self.sessions[0]
+                channel_info.http_accessible = await self._test_channel_access_with_retry(
+                    session, channel_info.channel_id
+                )
+                channel_info.last_checked = datetime.now()
+                
+                # Добавляем канал к серверу
+                if server_info.add_channel(channel_info):
+                    # Добавляем к мониторингу
+                    if channel_info.http_accessible:
+                        self.monitored_channels.add(channel_info.channel_id)
+                    
+                    server_info.update_stats()
+                    
+                    self.logger.info("Channel successfully added through bot interface",
+                                   server=server_info.server_name,
+                                   channel=channel_info.channel_name,
+                                   accessible=channel_info.http_accessible)
+                else:
+                    self.logger.warning("Failed to add channel - server at capacity",
+                                      server=server_info.server_name,
+                                      max_channels=server_info.max_channels)
+            
+        except Exception as e:
+            self.logger.error("Error testing and adding channel", error=str(e))
+    
     
     def _get_healthy_session(self) -> Optional[aiohttp.ClientSession]:
         """Get a healthy session using round-robin with failure tracking"""

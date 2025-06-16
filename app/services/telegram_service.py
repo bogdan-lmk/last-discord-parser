@@ -62,9 +62,11 @@ class TelegramService:
         self._load_persistent_data()
     
     def set_discord_service(self, discord_service):
-        """Set Discord service reference for channel management"""
+        """Set Discord service reference for enhanced channel management"""
         self.discord_service = discord_service
-        self.logger.info("Discord service reference set for Telegram bot")
+        # НОВОЕ: Устанавливаем обратную ссылку
+        discord_service.set_telegram_service_ref(self)
+        self.logger.info("Enhanced Discord service integration established")
     
     async def initialize(self) -> bool:
         """Initialize Enhanced Telegram service with startup verification"""
