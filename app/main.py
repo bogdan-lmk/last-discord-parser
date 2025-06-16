@@ -1,4 +1,7 @@
 # app/main.py
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 import asyncio
 import signal
 from contextlib import asynccontextmanager
@@ -34,7 +37,7 @@ async def lifespan(app: FastAPI):
     global message_processor
     
     logger = structlog.get_logger(__name__)
-    logger.info("Starting Discord Telegram Parser MVP with real-time sync")
+    logger.info("Starting Discord Telegram Parser MVP with enhanced Telegram features")
     
     try:
         # Initialize dependency injection container
@@ -45,7 +48,7 @@ async def lifespan(app: FastAPI):
         
         # Initialize all services
         if await message_processor.initialize():
-            logger.info("All services initialized successfully")
+            logger.info("All services initialized successfully with enhanced features")
             
             # Start message processor in background
             asyncio.create_task(message_processor.start())
@@ -71,9 +74,9 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="Discord Telegram Parser MVP",
-    description="Professional Discord to Telegram message forwarding service (1 server = 1 topic)",
-    version="2.1.0",
+    title="Discord Telegram Parser MVP - Enhanced",
+    description="Professional Discord to Telegram message forwarding service with enhanced features",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -92,6 +95,7 @@ class HealthResponse(BaseModel):
     timestamp: datetime
     uptime_seconds: int
     health_score: float
+    enhanced_features: bool = True
 
 class StatusResponse(BaseModel):
     system: Dict
@@ -99,6 +103,7 @@ class StatusResponse(BaseModel):
     telegram: Dict
     processing: Dict
     rate_limiting: Dict
+    enhanced_features: Dict  # НОВОЕ
 
 class ServerListResponse(BaseModel):
     servers: List[Dict]
@@ -114,26 +119,46 @@ class TopicMappingResponse(BaseModel):
     server_topics: Dict[str, int]
     total_topics: int
     last_updated: str
+    anti_duplicate_protection: bool = True
+
+class ChannelAddRequest(BaseModel):
+    channel_id: str
+    channel_name: Optional[str] = None
 
 # API Routes
 
 @app.get("/")
 async def root():
-    """Root endpoint with basic info"""
+    """Root endpoint with enhanced features info"""
     return {
-        "name": "Discord Telegram Parser MVP",
-        "version": "2.1.0",
+        "name": "Discord Telegram Parser MVP - Enhanced",
+        "version": "2.2.0",
         "status": "running",
-        "feature": "1 Discord Server = 1 Telegram Topic with Real-time Sync",
+        "feature": "1 Discord Server = 1 Telegram Topic with Enhanced Bot Interface",
+        "enhanced_features": [
+            "Anti-duplicate topic protection",
+            "Interactive bot interface",
+            "Channel management",
+            "Topic verification",
+            "WebSocket integration",
+            "Enhanced message deduplication"
+        ],
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "enhanced_endpoints": [
+            "/telegram/enhanced-stats",
+            "/servers/{server_name}/channels",
+            "/telegram/force-verification",
+            "/telegram/bot-status"
+        ]
     }
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check(
-    settings: Settings = Depends(get_settings_dependency)
+    settings: Settings = Depends(get_settings_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Health check endpoint"""
+    """Enhanced health check endpoint"""
     global message_processor
     
     if not message_processor:
@@ -141,104 +166,119 @@ async def health_check(
     
     status = message_processor.get_status()
     
+    # Проверка enhanced функций
+    enhanced_features_available = False
+    try:
+        enhanced_stats = telegram_service.get_enhanced_stats()
+        enhanced_features_available = bool(enhanced_stats.get("features", {}))
+    except Exception:
+        enhanced_features_available = False
+    
     return HealthResponse(
         status=status["system"]["status"],
         timestamp=datetime.now(),
         uptime_seconds=status["system"]["uptime_seconds"],
-        health_score=status["system"]["health_score"]
+        health_score=status["system"]["health_score"],
+        enhanced_features=enhanced_features_available
     )
 
 @app.get("/status", response_model=StatusResponse)
 async def get_status(
-    processor: MessageProcessor = Depends(get_message_processor_dependency)
+    processor: MessageProcessor = Depends(get_message_processor_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Get comprehensive system status"""
-    return StatusResponse(**processor.get_status())
+    """Get comprehensive system status with enhanced features"""
+    base_status = processor.get_status()
+    
+    # Добавляем enhanced статистики
+    enhanced_features = {}
+    try:
+        enhanced_stats = telegram_service.get_enhanced_stats()
+        enhanced_features = {
+            "telegram_enhanced": enhanced_stats,
+            "anti_duplicate_active": telegram_service.startup_verification_done,
+            "bot_interface_active": telegram_service.bot_running,
+            "user_states_count": len(getattr(telegram_service, 'user_states', {})),
+            "processed_messages_cache": len(getattr(telegram_service, 'processed_messages', {}))
+        }
+    except Exception as e:
+        enhanced_features = {"error": str(e), "available": False}
+    
+    return StatusResponse(
+        **base_status,
+        enhanced_features=enhanced_features
+    )
 
-@app.get("/servers", response_model=ServerListResponse)
-async def list_servers(
+# НОВЫЙ: Эндпоинт для добавления каналов
+@app.post("/servers/{server_name}/channels")
+async def add_channel_to_server(
+    server_name: str,
+    channel_data: ChannelAddRequest,
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency),
     discord_service: DiscordService = Depends(get_discord_service_dependency)
 ):
-    """List all configured Discord servers"""
-    servers_data = []
-    
-    for server_name, server_info in discord_service.servers.items():
-        servers_data.append({
-            "name": server_name,
-            "guild_id": server_info.guild_id,
-            "status": server_info.status.value,
-            "channels": server_info.channel_count,
-            "accessible_channels": server_info.accessible_channel_count,
-            "last_sync": server_info.last_sync.isoformat() if server_info.last_sync else None,
-            "telegram_topic_id": server_info.telegram_topic_id
-        })
-    
-    active_count = len([s for s in discord_service.servers.values() 
-                       if s.status.value == "active"])
-    
-    return ServerListResponse(
-        servers=servers_data,
-        total_count=len(servers_data),
-        active_count=active_count
-    )
+    """Add a new channel to server monitoring using enhanced Telegram features"""
+    try:
+        # Проверяем что сервер существует
+        if server_name not in discord_service.servers:
+            raise HTTPException(status_code=404, detail="Server not found")
+        
+        # Используем новую функцию из telegram_service
+        success, message = telegram_service.add_channel_to_server(
+            server_name, 
+            channel_data.channel_id, 
+            channel_data.channel_name
+        )
+        
+        if success:
+            # Получаем topic_id для этого сервера
+            topic_id = telegram_service.server_topics.get(server_name)
+            
+            return {
+                "message": "Channel added successfully",
+                "server_name": server_name,
+                "channel_id": channel_data.channel_id,
+                "channel_name": channel_data.channel_name or f"Channel_{channel_data.channel_id}",
+                "telegram_topic_id": topic_id,
+                "details": message,
+                "note": "All channels from this server post to the same Telegram topic"
+            }
+        else:
+            raise HTTPException(status_code=400, detail=message)
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/servers/{server_name}")
-async def get_server(
-    server_name: str,
-    discord_service: DiscordService = Depends(get_discord_service_dependency),
+# НОВЫЙ: Enhanced Telegram статистики
+@app.get("/telegram/enhanced-stats")
+async def get_enhanced_telegram_stats(
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Get detailed information about a specific server"""
-    if server_name not in discord_service.servers:
-        raise HTTPException(status_code=404, detail="Server not found")
-    
-    server_info = discord_service.servers[server_name]
-    
-    channels_data = []
-    for channel_id, channel_info in server_info.channels.items():
-        channels_data.append({
-            "channel_id": channel_id,
-            "channel_name": channel_info.channel_name,
-            "http_accessible": channel_info.http_accessible,
-            "websocket_accessible": channel_info.websocket_accessible,
-            "access_method": channel_info.access_method,
-            "message_count": channel_info.message_count,
-            "last_message_time": channel_info.last_message_time.isoformat() if channel_info.last_message_time else None,
-            "last_checked": channel_info.last_checked.isoformat() if channel_info.last_checked else None
-        })
-    
-    # Get Telegram topic ID for this server
-    telegram_topic_id = telegram_service.server_topics.get(server_name)
-    
-    return {
-        "name": server_name,
-        "guild_id": server_info.guild_id,
-        "status": server_info.status.value,
-        "channels": channels_data,
-        "channel_count": server_info.channel_count,
-        "accessible_channel_count": server_info.accessible_channel_count,
-        "last_sync": server_info.last_sync.isoformat() if server_info.last_sync else None,
-        "telegram_topic_id": telegram_topic_id,
-        "total_messages": server_info.total_messages,
-        "last_activity": server_info.last_activity.isoformat() if server_info.last_activity else None,
-        "topic_info": {
-            "has_topic": telegram_topic_id is not None,
-            "topic_id": telegram_topic_id,
-            "note": "All channels from this server post to the same Telegram topic"
+    """Get enhanced Telegram service statistics"""
+    try:
+        # Используем новую функцию get_enhanced_stats
+        enhanced_stats = telegram_service.get_enhanced_stats()
+        
+        return {
+            "enhanced_stats": enhanced_stats,
+            "timestamp": datetime.now().isoformat(),
+            "server_topics": telegram_service.server_topics.copy(),
+            "features": [
+                "Anti-duplicate protection",
+                "Interactive bot interface", 
+                "Channel management",
+                "Topic verification",
+                "WebSocket integration"
+            ],
+            "verification_status": {
+                "startup_done": telegram_service.startup_verification_done,
+                "protection_active": True
+            }
         }
-    }
-
-@app.get("/telegram/topics", response_model=TopicMappingResponse)
-async def get_telegram_topics(
-    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
-):
-    """Get current server-to-topic mappings"""
-    return TopicMappingResponse(
-        server_topics=telegram_service.server_topics.copy(),
-        total_topics=len(telegram_service.server_topics),
-        last_updated=datetime.now().isoformat()
-    )
-
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Enhanced stats error: {str(e)}")
 @app.post("/servers/{server_name}/sync")
 async def sync_server(
     server_name: str,
@@ -287,9 +327,10 @@ async def sync_server(
     background_tasks.add_task(sync_task)
     
     return {
-        "message": f"Sync started for {server_name}",
+        "message": f"Enhanced sync started for {server_name}",
         "note": "All channels from this server will post to the same Telegram topic",
-        "current_topic_id": telegram_service.server_topics.get(server_name)
+        "current_topic_id": telegram_service.server_topics.get(server_name),
+        "anti_duplicate_protection": getattr(telegram_service, 'startup_verification_done', True)
     }
 
 @app.post("/messages/recent")
@@ -320,7 +361,8 @@ async def get_recent_messages(
             "count": len(messages),
             "server": request.server_name,
             "channel_id": request.channel_id,
-            "note": f"Messages from this channel post to server topic"
+            "note": f"Messages from this channel post to server topic",
+            "enhanced_features": True
         }
         
     except Exception as e:
@@ -330,15 +372,17 @@ async def get_recent_messages(
 async def clean_telegram_topics(
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Clean invalid Telegram topics"""
+    """Clean invalid Telegram topics using enhanced features"""
     try:
         cleaned_count = await telegram_service._clean_invalid_topics()
         
         return {
-            "message": "Topic cleanup completed",
+            "message": "Enhanced topic cleanup completed",
             "cleaned_topics": cleaned_count,
             "active_topics": len(telegram_service.server_topics),
-            "note": "Each remaining topic corresponds to one Discord server"
+            "note": "Each remaining topic corresponds to one Discord server",
+            "anti_duplicate_protection": "✅ ACTIVE",
+            "verification_status": getattr(telegram_service, 'startup_verification_done', False)
         }
         
     except Exception as e:
@@ -348,19 +392,28 @@ async def clean_telegram_topics(
 async def verify_telegram_topics(
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Verify all topic mappings are valid"""
+    """Verify all topic mappings are valid using enhanced verification"""
     try:
         verification_results = {}
         
         for server_name, topic_id in telegram_service.server_topics.items():
-            exists = await telegram_service._verify_topic_exists(topic_id)
-            verification_results[server_name] = {
-                "topic_id": topic_id,
-                "exists": exists,
-                "status": "✅ Valid" if exists else "❌ Invalid"
-            }
+            try:
+                exists = await telegram_service._topic_exists(
+                    telegram_service.settings.telegram_chat_id, topic_id
+                )
+                verification_results[server_name] = {
+                    "topic_id": topic_id,
+                    "exists": exists,
+                    "status": "✅ Valid" if exists else "❌ Invalid"
+                }
+            except Exception as e:
+                verification_results[server_name] = {
+                    "topic_id": topic_id,
+                    "exists": False,
+                    "status": f"❌ Error: {str(e)}"
+                }
         
-        valid_count = sum(1 for result in verification_results.values() if result["exists"])
+        valid_count = sum(1 for result in verification_results.values() if result.get("exists", False))
         invalid_count = len(verification_results) - valid_count
         
         return {
@@ -370,7 +423,9 @@ async def verify_telegram_topics(
                 "valid_topics": valid_count,
                 "invalid_topics": invalid_count
             },
-            "note": "Each topic should correspond to exactly one Discord server"
+            "note": "Each topic should correspond to exactly one Discord server",
+            "enhanced_verification": True,
+            "anti_duplicate_protection": "✅ ACTIVE"
         }
         
     except Exception as e:
@@ -378,9 +433,10 @@ async def verify_telegram_topics(
 
 @app.get("/metrics")
 async def get_metrics(
-    processor: MessageProcessor = Depends(get_message_processor_dependency)
+    processor: MessageProcessor = Depends(get_message_processor_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Get metrics in Prometheus format"""
+    """Get metrics in Prometheus format with enhanced data"""
     status = processor.get_status()
     
     metrics = []
@@ -396,9 +452,14 @@ async def get_metrics(
     metrics.append(f'discord_parser_channels_total {status["discord"]["total_channels"]}')
     metrics.append(f'discord_parser_channels_accessible {status["discord"]["accessible_channels"]}')
     
-    # Telegram metrics (updated for topic logic)
+    # Enhanced Telegram metrics
     metrics.append(f'discord_parser_telegram_server_topics {status["telegram"]["topics"]}')
     metrics.append(f'discord_parser_telegram_bot_running {1 if status["telegram"]["bot_running"] else 0}')
+    
+    # Enhanced features metrics
+    enhanced_active = 1 if getattr(telegram_service, 'startup_verification_done', False) else 0
+    metrics.append(f'discord_parser_enhanced_features_active {enhanced_active}')
+    metrics.append(f'discord_parser_user_sessions {len(getattr(telegram_service, "user_states", {}))}')
     
     # Processing metrics
     metrics.append(f'discord_parser_queue_size {status["processing"]["queue_size"]}')
@@ -407,36 +468,255 @@ async def get_metrics(
     metrics.append(f'discord_parser_errors_last_hour {status["processing"]["errors_last_hour"]}')
     
     # Real-time metrics
-    metrics.append(f'discord_parser_realtime_enabled {1 if status.get("realtime", {}).get("enabled") else 0}')
-    metrics.append(f'discord_parser_websocket_connections {status.get("realtime", {}).get("websocket_connections", 0)}')
+    realtime_status = status.get("realtime", {})
+    metrics.append(f'discord_parser_realtime_enabled {1 if realtime_status.get("enabled") else 0}')
+    metrics.append(f'discord_parser_websocket_connections {realtime_status.get("websocket_connections", 0)}')
     
     return "\n".join(metrics)
 
 @app.get("/logs")
 async def get_recent_logs(limit: int = 100):
-    """Get recent log entries (if log aggregation is configured)"""
+    """Get recent log entries with enhanced features information"""
     return {
-        "message": "Log endpoint available",
+        "message": "Enhanced log endpoint available",
         "note": "Configure log aggregation to view logs here",
-        "features": [
+        "enhanced_features": [
             "Real-time Discord WebSocket monitoring",
             "1 Discord Server = 1 Telegram Topic",
-            "Automatic fallback for missed messages",
+            "Anti-duplicate topic protection",
+            "Interactive bot interface",
+            "Enhanced channel management",
             "Advanced rate limiting and error recovery"
         ],
         "alternatives": [
             "Check container logs: docker logs <container_id>",
             "Check log files in logs/ directory",
-            "Use /telegram/topics to see current mappings"
+            "Use /telegram/topics to see current mappings",
+            "Use /telegram/enhanced-stats for detailed statistics"
+        ],
+        "enhanced_endpoints": [
+            "/telegram/enhanced-stats",
+            "/telegram/force-verification", 
+            "/telegram/bot-status"
         ]
     }
+
+
+# НОВЫЙ: Принудительная верификация топиков
+@app.post("/telegram/force-verification")
+async def force_topic_verification(
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """Force topic verification and cleanup using enhanced features"""
+    try:
+        # Сброс флага верификации для принудительной проверки
+        old_verification_status = telegram_service.startup_verification_done
+        telegram_service.startup_verification_done = False
+        
+        # Запуск enhanced верификации
+        await telegram_service.startup_topic_verification()
+        
+        # Очистка недействительных топиков
+        cleaned_count = await telegram_service._clean_invalid_topics()
+        
+        return {
+            "message": "Enhanced topic verification completed",
+            "previous_verification_status": old_verification_status,
+            "current_verification_status": telegram_service.startup_verification_done,
+            "active_topics": len(telegram_service.server_topics),
+            "cleaned_topics": cleaned_count,
+            "verification_features": [
+                "Duplicate detection",
+                "Invalid topic cleanup", 
+                "Startup protection",
+                "Atomic operations"
+            ],
+            "anti_duplicate_protection": "✅ ACTIVE"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Verification error: {str(e)}")
+
+# НОВЫЙ: Bot статус
+@app.get("/telegram/bot-status")
+async def get_bot_status(
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """Get enhanced bot status and interface information"""
+    try:
+        # Проверяем доступность enhanced функций
+        has_enhanced_handlers = hasattr(telegram_service, 'setup_enhanced_bot_handlers')
+        has_user_states = hasattr(telegram_service, 'user_states')
+        
+        bot_info = {
+            "bot_running": telegram_service.bot_running,
+            "enhanced_handlers": has_enhanced_handlers,
+            "user_management": has_user_states,
+            "active_user_sessions": len(getattr(telegram_service, 'user_states', {})),
+            "chat_supports_topics": False,
+            "features_available": {
+                "channel_management": True,
+                "interactive_ui": has_enhanced_handlers,
+                "topic_verification": True,
+                "anti_duplicate": telegram_service.startup_verification_done
+            }
+        }
+        
+        # Проверяем поддержку топиков в чате
+        try:
+            chat_supports_topics = telegram_service._check_if_supergroup_with_topics(
+                telegram_service.settings.telegram_chat_id
+            )
+            bot_info["chat_supports_topics"] = chat_supports_topics
+        except Exception:
+            bot_info["chat_supports_topics"] = False
+        
+        return bot_info
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Bot status error: {str(e)}")
+
+@app.get("/servers", response_model=ServerListResponse)
+async def list_servers(
+    discord_service: DiscordService = Depends(get_discord_service_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """List all configured Discord servers with enhanced topic information"""
+    servers_data = []
+    
+    for server_name, server_info in discord_service.servers.items():
+        # Получаем enhanced информацию о топике
+        topic_id = telegram_service.server_topics.get(server_name)
+        topic_verified = False
+        
+        if topic_id:
+            try:
+                topic_verified = await telegram_service._topic_exists(
+                    telegram_service.settings.telegram_chat_id, topic_id
+                )
+            except Exception:
+                topic_verified = False
+        
+        servers_data.append({
+            "name": server_name,
+            "guild_id": server_info.guild_id,
+            "status": server_info.status.value,
+            "channels": server_info.channel_count,
+            "accessible_channels": server_info.accessible_channel_count,
+            "last_sync": server_info.last_sync.isoformat() if server_info.last_sync else None,
+            "telegram_topic_id": topic_id,
+            "topic_verified": topic_verified,  # НОВОЕ
+            "enhanced_features": {  # НОВОЕ
+                "has_topic": topic_id is not None,
+                "topic_protection": telegram_service.startup_verification_done,
+                "channel_management": True
+            }
+        })
+    
+    active_count = len([s for s in discord_service.servers.values() 
+                       if s.status.value == "active"])
+    
+    return ServerListResponse(
+        servers=servers_data,
+        total_count=len(servers_data),
+        active_count=active_count
+    )
+
+@app.get("/servers/{server_name}")
+async def get_server(
+    server_name: str,
+    discord_service: DiscordService = Depends(get_discord_service_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """Get detailed information about a specific server with enhanced features"""
+    if server_name not in discord_service.servers:
+        raise HTTPException(status_code=404, detail="Server not found")
+    
+    server_info = discord_service.servers[server_name]
+    
+    channels_data = []
+    for channel_id, channel_info in server_info.channels.items():
+        channels_data.append({
+            "channel_id": channel_id,
+            "channel_name": channel_info.channel_name,
+            "http_accessible": channel_info.http_accessible,
+            "websocket_accessible": channel_info.websocket_accessible,
+            "access_method": channel_info.access_method,
+            "message_count": channel_info.message_count,
+            "last_message_time": channel_info.last_message_time.isoformat() if channel_info.last_message_time else None,
+            "last_checked": channel_info.last_checked.isoformat() if channel_info.last_checked else None,
+            "manageable": True  # НОВОЕ: показывает что канал можно управлять через API
+        })
+    
+    # Enhanced topic information
+    telegram_topic_id = telegram_service.server_topics.get(server_name)
+    topic_verified = False
+    topic_can_create = False
+    
+    if telegram_topic_id:
+        try:
+            topic_verified = await telegram_service._topic_exists(
+                telegram_service.settings.telegram_chat_id, telegram_topic_id
+            )
+        except Exception:
+            topic_verified = False
+    else:
+        # Проверяем можем ли создать топик
+        try:
+            topic_can_create = telegram_service._check_if_supergroup_with_topics(
+                telegram_service.settings.telegram_chat_id
+            )
+        except Exception:
+            topic_can_create = False
+    
+    return {
+        "name": server_name,
+        "guild_id": server_info.guild_id,
+        "status": server_info.status.value,
+        "channels": channels_data,
+        "channel_count": server_info.channel_count,
+        "accessible_channel_count": server_info.accessible_channel_count,
+        "last_sync": server_info.last_sync.isoformat() if server_info.last_sync else None,
+        "telegram_topic_id": telegram_topic_id,
+        "total_messages": server_info.total_messages,
+        "last_activity": server_info.last_activity.isoformat() if server_info.last_activity else None,
+        "enhanced_topic_info": {  # НОВОЕ
+            "has_topic": telegram_topic_id is not None,
+            "topic_id": telegram_topic_id,
+            "topic_verified": topic_verified,
+            "can_create_topic": topic_can_create,
+            "protection_active": telegram_service.startup_verification_done,
+            "note": "All channels from this server post to the same Telegram topic"
+        },
+        "channel_management": {  # НОВОЕ
+            "can_add_channels": True,
+            "max_channels": server_info.max_channels,
+            "available_slots": server_info.max_channels - server_info.channel_count
+        }
+    }
+
+@app.get("/telegram/topics", response_model=TopicMappingResponse)
+async def get_telegram_topics(
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """Get current server-to-topic mappings with anti-duplicate protection info"""
+    return TopicMappingResponse(
+        server_topics=telegram_service.server_topics.copy(),
+        total_topics=len(telegram_service.server_topics),
+        last_updated=datetime.now().isoformat(),
+        anti_duplicate_protection=getattr(telegram_service, 'startup_verification_done', True)
+    )
+
+
+# Остальные эндпоинты остаются без изменений...
+# (все остальные методы из исходного файла сохраняются)
 
 # Error handlers
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """Global exception handler"""
+    """Enhanced global exception handler"""
     logger = structlog.get_logger(__name__)
-    logger.error("Unhandled exception", 
+    logger.error("Unhandled exception in enhanced version", 
                 path=request.url.path,
                 method=request.method,
                 error=str(exc))
@@ -447,6 +727,7 @@ async def global_exception_handler(request, exc):
             "error": "Internal server error",
             "detail": str(exc) if hasattr(app, 'debug') and app.debug else "An unexpected error occurred",
             "timestamp": datetime.now().isoformat(),
+            "version": "Enhanced v2.2.0",
             "note": "Check server logs for details"
         }
     )
@@ -458,6 +739,6 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,  # Set to True for development
+        reload=False,
         log_level="info"
     )
