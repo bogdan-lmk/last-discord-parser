@@ -76,8 +76,12 @@ class MessageProcessor:
             self.logger.error("Telegram service initialization failed")
             return False
         
+        # ENHANCED: Set Discord service reference for channel management
+        self.telegram_service.set_discord_service(self.discord_service)
+        
         # ИСПРАВЛЕНИЕ: Правильная регистрация колбэка
         self.discord_service.add_message_callback(self._handle_realtime_message)
+        
         
         # Initialize sync intervals for each server
         for server_name in self.discord_service.servers.keys():
