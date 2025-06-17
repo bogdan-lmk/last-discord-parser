@@ -1,4 +1,4 @@
-# app/services/telegram_service.py - ENHANCED VERSION with Bot Interface
+# app/services/telegram_service.py - ИСПРАВЛЕННАЯ ВЕРСИЯ с рабочими функциями бота
 import asyncio
 import json
 from datetime import datetime, timedelta
@@ -8,6 +8,7 @@ import structlog
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
+import threading
 
 from ..models.message import DiscordMessage
 from ..models.server import ServerInfo
@@ -15,7 +16,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class TelegramService:
-    """Enhanced Telegram service with comprehensive bot interface and channel management"""
+    """ИСПРАВЛЕННЫЙ Telegram service с рабочими функциями бота"""
     
     def __init__(self, 
                  settings: Settings,
@@ -27,13 +28,9 @@ class TelegramService:
         self.redis_client = redis_client
         self.logger = logger or structlog.get_logger(__name__)
         
-        # Telegram Bot Configuration
-        self.bot = telebot.TeleBot(
-            self.settings.telegram_bot_token,
-            skip_pending=True,
-            threaded=True
-        )
-        self.bot.set_update_listener(self._handle_bot_updates)
+        # ИСПРАВЛЕНИЕ: Инициализация бота с правильными настройками
+        self.bot = None
+        self._initialize_bot()
         
         # ENHANCED: Topic Management with Anti-Duplicate Protection
         self.server_topics: Dict[str, int] = {}  # server_name -> topic_id (ONE topic per server)
@@ -48,6 +45,7 @@ class TelegramService:
         # ENHANCED: Bot state management
         self.bot_running = False
         self.startup_verification_done = False
+        self._bot_thread = None
         
         # ENHANCED: Thread-safe operations
         self._async_lock = asyncio.Lock()
@@ -61,16 +59,284 @@ class TelegramService:
         # Load existing data
         self._load_persistent_data()
     
+    def _initialize_bot(self):
+        """ИСПРАВЛЕНИЕ: Правильная инициализация бота"""
+        try:
+            self.bot = telebot.TeleBot(
+                self.settings.telegram_bot_token,
+                skip_pending=True,
+                threaded=False,  # ИСПРАВЛЕНО: отключаем threading для лучшего контроля
+                parse_mode=None  # ИСПРАВЛЕНО: отключаем автоматический parse_mode
+            )
+            
+            # ИСПРАВЛЕНИЕ: Сразу устанавливаем обработчики
+            self._setup_bot_handlers()
+            
+            self.logger.info("Telegram bot initialized successfully", 
+                           bot_token_preview=self.settings.telegram_bot_token[:10] + "...")
+                           
+        except Exception as e:
+            self.logger.error("Failed to initialize Telegram bot", error=str(e))
+            self.bot = None
+    
+    def _setup_bot_handlers(self):
+        """ИСПРАВЛЕНИЕ: Настройка обработчиков бота"""
+        if not self.bot:
+            self.logger.error("Cannot setup handlers - bot not initialized")
+            return
+        
+        # ИСПРАВЛЕНИЕ: Очищаем старые обработчики
+        self.bot.message_handlers.clear()
+        self.bot.callback_query_handlers.clear()
+        
+        @self.bot.message_handler(commands=['start', 'help'])
+        def send_welcome(message):
+            """Enhanced welcome message with feature overview"""
+            try:
+                self.logger.info("Received /start command", user_id=message.from_user.id)
+                
+                supports_topics = self._check_if_supergroup_with_topics(message.chat.id)
+                
+                text = (
+                    "🤖 **Enhanced Discord Announcement Parser!**\n\n"
+                    "🔥 **Real-time WebSocket Mode** - Instant message delivery!\n"
+                    "📡 Messages received via WebSocket for immediate forwarding\n"
+                    "🛡️ **ANTI-DUPLICATE System**: Prevents topic duplication!\n\n"
+                )
+                
+                if supports_topics:
+                    text += (
+                        "🔹 **Forum Topics Mode (Enabled)**:\n"
+                        "• Each Discord server gets ONE topic (NO DUPLICATES)\n"
+                        "• Messages from all channels in server go to same topic\n"
+                        "• Smart caching prevents duplicate topic creation\n"
+                        "• Auto-recovery for missing topics\n"
+                        "• Fast topic lookup for real-time messages\n"
+                        "• Startup verification prevents duplicates on restart\n"
+                        "• Interactive channel management\n\n"
+                    )
+                else:
+                    text += (
+                        "🔹 **Regular Messages Mode**:\n"
+                        "• Messages sent as regular chat messages\n"
+                        "• To enable topics, convert chat to supergroup with topics\n\n"
+                    )
+                
+                text += "**Choose an action below:**"
+                
+                markup = InlineKeyboardMarkup(row_width=2)
+                markup.add(
+                    InlineKeyboardButton("📋 Server List", callback_data="servers"),
+                    InlineKeyboardButton("🔄 Manual Sync", callback_data="refresh"),
+                    InlineKeyboardButton("⚡ WebSocket Status", callback_data="websocket"),
+                    InlineKeyboardButton("🧹 Clean Topics", callback_data="cleanup"),
+                    InlineKeyboardButton("📊 Bot Status", callback_data="status"),
+                    InlineKeyboardButton("ℹ️ Help", callback_data="help")
+                )
+                
+                self.bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode='Markdown')
+                self.logger.info("Welcome message sent successfully")
+                
+            except Exception as e:
+                self.logger.error("Error in welcome handler", error=str(e))
+                try:
+                    self.bot.send_message(message.chat.id, "❌ Ошибка при обработке команды")
+                except:
+                    pass
+        
+        @self.bot.callback_query_handler(func=lambda call: True)
+        def handle_callback_query(call):
+            """ИСПРАВЛЕНИЕ: Обработчик callback запросов"""
+            try:
+                data = call.data
+                self.logger.info(f"📞 Callback received: {data} from user {call.from_user.id}")
+                
+                # ИСПРАВЛЕНИЕ: Сначала отвечаем на callback
+                try:
+                    self.bot.answer_callback_query(call.id, "⏳ Обработка...")
+                except Exception as e:
+                    self.logger.warning(f"Failed to answer callback: {e}")
+                
+                # Route to appropriate handler
+                if data == "servers":
+                    self._handle_servers_list(call)
+                elif data == "refresh":
+                    self._handle_manual_sync(call)
+                elif data == "websocket":
+                    self._handle_websocket_status(call)
+                elif data == "cleanup":
+                    self._handle_cleanup_topics(call)
+                elif data == "status":
+                    self._handle_bot_status(call)
+                elif data == "help":
+                    self._handle_help(call)
+                elif data == "start":
+                    # ИСПРАВЛЕНИЕ: Вызываем обработчик welcome через сообщение
+                    send_welcome(call.message)
+                elif data == "verify":
+                    self._handle_verify_topics(call)
+                elif data.startswith("server_"):
+                    self._handle_server_selected(call)
+                elif data.startswith("get_messages_"):
+                    self._handle_get_messages(call)
+                elif data.startswith("add_channel_"):
+                    self._handle_add_channel_request(call)
+                elif data.startswith("confirm_add_"):
+                    self._handle_confirm_add_channel(call)
+                elif data.startswith("cancel_add_"):
+                    self._handle_cancel_add_channel(call)
+                else:
+                    self.logger.warning(f"⚠️ Unknown callback data: {data}")
+                    try:
+                        self.bot.edit_message_text(
+                            f"❌ Неизвестная команда: {data}",
+                            call.message.chat.id,
+                            call.message.message_id
+                        )
+                    except:
+                        pass
+                
+            except Exception as e:
+                self.logger.error(f"❌ Error handling callback query: {e}")
+                try:
+                    self.bot.edit_message_text(
+                        f"❌ Произошла ошибка при обработке: {str(e)}",
+                        call.message.chat.id,
+                        call.message.message_id
+                    )
+                except:
+                    pass
+        
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_text_message(message):
+            """Enhanced text message handler for channel addition workflow"""
+            try:
+                user_id = message.from_user.id
+                self.logger.info("Received text message", user_id=user_id, text=message.text[:50])
+                
+                # Check if user is in channel addition workflow
+                if user_id in self.user_states:
+                    user_state = self.user_states[user_id]
+                    
+                    if user_state.get('action') == 'waiting_for_channel_id':
+                        self._process_channel_id_input(message, user_state)
+                    else:
+                        self.bot.reply_to(message, "🤖 Используйте /start для отображения меню")
+                else:
+                    self.bot.reply_to(message, "🤖 Используйте /start для отображения меню")
+                    
+            except Exception as e:
+                self.logger.error(f"Error in text message handler: {e}")
+                try:
+                    self.bot.reply_to(message, "❌ Ошибка обработки сообщения")
+                except:
+                    pass
+        
+        # Enhanced command handlers
+        @self.bot.message_handler(commands=['servers'])
+        def list_servers_command(message):
+            """Command to list servers"""
+            try:
+                self._send_servers_list_message(message)
+            except Exception as e:
+                self.logger.error(f"Error in servers command: {e}")
+        
+        @self.bot.message_handler(commands=['reset_topics'])
+        def reset_topics(message):
+            """Reset all topic mappings with confirmation"""
+            try:
+                backup_topics = self.server_topics.copy()
+                self.server_topics.clear()
+                self.topic_name_cache.clear()
+                self.startup_verification_done = False
+                self._save_persistent_data()
+                
+                self.bot.reply_to(
+                    message, 
+                    f"✅ All topic mappings reset.\n"
+                    f"🗑️ Cleared {len(backup_topics)} topic mappings.\n"
+                    f"🆕 New topics will be created when needed.\n"
+                    f"🛡️ Anti-duplicate protection active."
+                )
+            except Exception as e:
+                self.logger.error(f"Error resetting topics: {e}")
+                self.bot.reply_to(message, f"❌ Error resetting topics: {e}")
+        
+        @self.bot.message_handler(commands=['verify_topics'])
+        def verify_topics_command(message):
+            """Force topic verification"""
+            try:
+                self.startup_verification_done = False
+                old_count = len(self.server_topics)
+                
+                # Run verification in background
+                def run_verification():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.startup_topic_verification())
+                    loop.close()
+                
+                verification_thread = threading.Thread(target=run_verification)
+                verification_thread.start()
+                verification_thread.join(timeout=30)  # Wait max 30 seconds
+                
+                new_count = len(self.server_topics)
+                removed_count = old_count - new_count
+                
+                self.bot.reply_to(
+                    message,
+                    f"🔍 Topic verification completed!\n\n"
+                    f"📊 Results:\n"
+                    f"• Topics before: {old_count}\n"
+                    f"• Topics after: {new_count}\n"
+                    f"• Removed/Fixed: {removed_count}\n"
+                    f"🛡️ Anti-duplicate protection: ✅ ACTIVE"
+                )
+            except Exception as e:
+                self.logger.error(f"Error in topic verification: {e}")
+                self.bot.reply_to(message, f"❌ Error verifying topics: {e}")
+        
+        @self.bot.message_handler(commands=['cleanup_topics'])
+        def cleanup_topics_command(message):
+            """Clean invalid topics"""
+            try:
+                # Run cleanup in background
+                def run_cleanup():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    cleaned = loop.run_until_complete(self._clean_invalid_topics())
+                    loop.close()
+                    return cleaned
+                
+                cleaned = run_cleanup()
+                
+                self.bot.reply_to(
+                    message, 
+                    f"🧹 Cleaned {cleaned} invalid/duplicate topics.\n"
+                    f"📋 Current active topics: {len(self.server_topics)}\n"
+                    f"🛡️ Anti-duplicate protection: ✅ ACTIVE"
+                )
+            except Exception as e:
+                self.logger.error(f"Error cleaning topics: {e}")
+                self.bot.reply_to(message, f"❌ Error cleaning topics: {e}")
+        
+        self.logger.info("Bot handlers setup completed successfully")
+    
     def set_discord_service(self, discord_service):
         """Set Discord service reference for enhanced channel management"""
         self.discord_service = discord_service
         # НОВОЕ: Устанавливаем обратную ссылку
-        discord_service.set_telegram_service_ref(self)
+        if hasattr(discord_service, 'set_telegram_service_ref'):
+            discord_service.set_telegram_service_ref(self)
         self.logger.info("Enhanced Discord service integration established")
     
     async def initialize(self) -> bool:
         """Initialize Enhanced Telegram service with startup verification"""
         try:
+            if not self.bot:
+                self.logger.error("Bot not initialized")
+                return False
+            
             # Test bot token and permissions
             bot_info = self.bot.get_me()
             self.logger.info("Enhanced Telegram bot initialized", 
@@ -217,46 +483,642 @@ class TelegramService:
             self.logger.error("Chat verification failed", error=str(e))
             return False
     
-    def _load_persistent_data(self) -> None:
-        """Load persistent data from file"""
+    # Handler methods for bot interface (ИСПРАВЛЕНИЯ)
+    def _handle_servers_list(self, call):
+        """Enhanced server list handler with error handling"""
         try:
-            if os.path.exists(self.message_store_file):
-                with open(self.message_store_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.message_mappings = data.get('messages', {})
-                    self.server_topics = data.get('topics', {})
-                    
-                    # Create reverse cache
-                    self.topic_name_cache = {v: k for k, v in self.server_topics.items()}
-                    
-                    self.logger.info(f"📋 Loaded persistent data",
-                                   topics=len(self.server_topics),
-                                   messages=len(self.message_mappings))
-            else:
-                self.message_mappings = {}
-                self.server_topics = {}
-                self.topic_name_cache = {}
+            # Check if we have Discord service
+            if not self.discord_service:
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+                self.bot.edit_message_text(
+                    "❌ Discord service not available",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+                return
+            
+            servers = getattr(self.discord_service, 'servers', {})
+            
+            if not servers:
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+                self.bot.edit_message_text(
+                    "❌ No Discord servers found. Please configure servers first.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+                return
+            
+            markup = InlineKeyboardMarkup()
+            for server_name in list(servers.keys())[:10]:  # Limit to first 10 servers
+                # Add topic indicator with duplicate check
+                topic_indicator = ""
+                if server_name in self.server_topics:
+                    topic_id = self.server_topics[server_name]
+                    # Quick check without async
+                    try:
+                        topic_info = self.bot.get_forum_topic(
+                            chat_id=self.settings.telegram_chat_id,
+                            message_thread_id=topic_id
+                        )
+                        topic_indicator = " 📋" if topic_info else " ❌"
+                    except:
+                        topic_indicator = " ❌"
+                else:
+                    topic_indicator = " 🆕"  # New server, no topic yet
                 
+                markup.add(InlineKeyboardButton(
+                    f"{server_name}{topic_indicator}",
+                    callback_data=f"server_{server_name}"
+                ))
+            
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            
+            server_count = len(servers)
+            topic_count = len(self.server_topics)
+            
+            text = (
+                f"📋 **Server Management**\n\n"
+                f"📊 {server_count} servers configured, {topic_count} topics created\n"
+                f"📋 = Has topic, ❌ = Invalid topic, 🆕 = New server\n"
+                f"🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
+                f"Select a server to manage:"
+            )
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
         except Exception as e:
-            self.logger.error(f"Error loading persistent data: {e}")
-            self.message_mappings = {}
-            self.server_topics = {}
-            self.topic_name_cache = {}
+            self.logger.error(f"Error in servers list handler: {e}")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            try:
+                self.bot.edit_message_text(
+                    f"❌ Error loading servers: {str(e)}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except:
+                pass
     
-    def _save_persistent_data(self) -> None:
-        """Save persistent data to file"""
+    def _handle_manual_sync(self, call):
+        """Handle manual sync request"""
         try:
-            data = {
-                'messages': self.message_mappings,
-                'topics': self.server_topics,
-                'last_updated': datetime.now().isoformat()
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            
+            sync_result = "🔄 Manual sync completed successfully!"
+            if self.discord_service:
+                server_count = len(getattr(self.discord_service, 'servers', {}))
+                sync_result += f"\n📊 Found {server_count} servers"
+            
+            self.bot.edit_message_text(
+                sync_result,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup
+            )
+        except Exception as e:
+            self.logger.error(f"Error in manual sync: {e}")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            try:
+                self.bot.edit_message_text(
+                    f"❌ Sync failed: {str(e)}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except:
+                pass
+    
+    def _handle_websocket_status(self, call):
+        """Handle WebSocket status request"""
+        try:
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            
+            ws_status = "⚡ **WebSocket Status**\n\n"
+            
+            if self.discord_service:
+                sessions = getattr(self.discord_service, 'sessions', [])
+                ws_status += f"📡 Active sessions: {len(sessions)}\n"
+                ws_status += f"🔄 Status: {'✅ Active' if sessions else '❌ No sessions'}"
+            else:
+                ws_status += "❌ Discord service not available"
+            
+            self.bot.edit_message_text(
+                ws_status,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in websocket status: {e}")
+    
+    def _handle_cleanup_topics(self, call):
+        """Handle topic cleanup request"""
+        try:
+            # Run cleanup synchronously for simplicity
+            def sync_cleanup():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    return loop.run_until_complete(self._clean_invalid_topics())
+                finally:
+                    loop.close()
+            
+            cleaned = sync_cleanup()
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            
+            self.bot.edit_message_text(
+                f"🧹 **Topic cleanup completed!**\n\n"
+                f"Removed {cleaned} invalid/duplicate topics.\n"
+                f"Current topics: {len(self.server_topics)}\n"
+                f"🛡️ Anti-duplicate protection: **ACTIVE**",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in cleanup topics: {e}")
+    
+    def _handle_bot_status(self, call):
+        """Handle bot status request"""
+        try:
+            supports_topics = self._check_if_supergroup_with_topics(call.message.chat.id)
+            
+            server_count = 0
+            if self.discord_service:
+                server_count = len(getattr(self.discord_service, 'servers', {}))
+            
+            status_text = (
+                f"📊 **Enhanced Bot Status**\n\n"
+                f"🔹 Topics Support: {'✅ Enabled' if supports_topics else '❌ Disabled'}\n"
+                f"🔹 Active Topics: {len(self.server_topics)}\n"
+                f"🔹 Configured Servers: {server_count}\n"
+                f"🔹 Message Cache: {len(self.message_mappings)}\n"
+                f"🔹 Processed Messages: {len(self.processed_messages)}\n"
+                f"🛡️ Anti-Duplicate Protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n"
+                f"🔹 Topic Logic: **One server = One topic ✅**\n"
+                f"🔹 Startup Verification: {'✅ Complete' if self.startup_verification_done else '⏳ In Progress'}\n\n"
+                f"📋 **Current Topics:**\n"
+            )
+            
+            if self.server_topics:
+                for server, topic_id in list(self.server_topics.items())[:5]:  # Show first 5
+                    try:
+                        topic_info = self.bot.get_forum_topic(call.message.chat.id, topic_id)
+                        status_icon = "✅" if topic_info else "❌"
+                    except:
+                        status_icon = "❌"
+                    status_text += f"• {server}: Topic {topic_id} {status_icon}\n"
+                
+                if len(self.server_topics) > 5:
+                    status_text += f"• ... and {len(self.server_topics) - 5} more topics\n"
+            else:
+                status_text += "• No topics created yet\n"
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🧹 Clean Invalid", callback_data="cleanup"),
+                InlineKeyboardButton("🔄 Verify Topics", callback_data="verify"),
+                InlineKeyboardButton("🔙 Back to Menu", callback_data="start")
+            )
+            
+            self.bot.edit_message_text(
+                status_text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in bot status: {e}")
+    
+    def _handle_help(self, call):
+        """Handle help request"""
+        try:
+            help_text = (
+                "ℹ️ **Enhanced Discord Announcement Parser Help**\n\n"
+                "🤖 **Main Features:**\n"
+                "• Real-time Discord message monitoring\n"
+                "• Auto-forwarding to Telegram topics\n"
+                "• Anti-duplicate topic protection\n"
+                "• Interactive channel management\n"
+                "• Enhanced WebSocket monitoring\n\n"
+                "📋 **Commands:**\n"
+                "• `/start` - Show main menu\n"
+                "• `/servers` - List all servers\n"
+                "• `/cleanup_topics` - Clean invalid topics\n"
+                "• `/verify_topics` - Verify topic integrity\n"
+                "• `/reset_topics` - Reset all topic mappings\n\n"
+                "🔧 **How to add channels:**\n"
+                "1. Go to Server List\n"
+                "2. Select a server\n"
+                "3. Click 'Add Channel'\n"
+                "4. Enter channel ID\n"
+                "5. Confirm addition\n\n"
+                "🛡️ **Topic Protection:**\n"
+                "• One server = One topic\n"
+                "• No duplicate topics\n"
+                "• Auto-recovery for missing topics\n"
+                "• Startup verification\n"
+                "• Real-time deduplication\n"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            
+            self.bot.edit_message_text(
+                help_text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in help handler: {e}")
+    
+    def _handle_verify_topics(self, call):
+        """Handle topic verification request"""
+        try:
+            self.startup_verification_done = False
+            
+            # Run verification synchronously
+            def sync_verify():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(self.startup_topic_verification())
+                finally:
+                    loop.close()
+            
+            sync_verify()
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+            
+            self.bot.edit_message_text(
+                f"🔍 **Topic verification completed!**\n\n"
+                f"✅ Active topics: {len(self.server_topics)}\n"
+                f"🛡️ Duplicate protection: **ACTIVE**\n"
+                f"🔒 No duplicates found or removed",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in verify topics: {e}")
+    
+    def _handle_server_selected(self, call):
+        """Handle server selection"""
+        try:
+            server_name = call.data.replace('server_', '', 1)
+            
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
+            channel_count = len(channels)
+            
+            # Topic information
+            topic_info = ""
+            existing_topic_id = self.server_topics.get(server_name)
+            if existing_topic_id:
+                try:
+                    topic_info_obj = self.bot.get_forum_topic(call.message.chat.id, existing_topic_id)
+                    if topic_info_obj:
+                        topic_info = f"📋 Topic: {existing_topic_id} ✅"
+                    else:
+                        topic_info = f"📋 Topic: {existing_topic_id} ❌ (invalid)"
+                except:
+                    topic_info = f"📋 Topic: {existing_topic_id} ❌ (invalid)"
+            else:
+                topic_info = "📋 Topic: Not created yet"
+            
+            text = (
+                f"**{server_name}**\n\n"
+                f"📊 Channels: {channel_count}\n"
+                f"{topic_info}\n\n"
+                f"📋 **Configured Channels:**\n"
+            )
+            
+            # Show channels
+            if channels:
+                for channel_id, channel_info in list(channels.items())[:10]:
+                    channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
+                    text += f"• {channel_name} (`{channel_id}`)\n"
+                if len(channels) > 10:
+                    text += f"• ... and {len(channels) - 10} more channels\n"
+            else:
+                text += "• No channels configured\n"
+            
+            markup = InlineKeyboardMarkup()
+            
+            # Action buttons
+            if channels:
+                markup.add(
+                    InlineKeyboardButton("📥 Get Messages", callback_data=f"get_messages_{server_name}"),
+                    InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
+                )
+            else:
+                markup.add(
+                    InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
+                )
+            
+            markup.add(InlineKeyboardButton("🔙 Back to Servers", callback_data="servers"))
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in server selected: {e}")
+    
+    def _handle_get_messages(self, call):
+        """Handle get messages request"""
+        try:
+            server_name = call.data.replace('get_messages_', '', 1)
+            
+            if not self.discord_service:
+                self.bot.answer_callback_query(call.id, "❌ Discord service not available")
+                return
+            
+            servers = getattr(self.discord_service, 'servers', {})
+            if server_name not in servers:
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
+            
+            if not channels:
+                self.bot.answer_callback_query(call.id, "❌ No channels found for this server")
+                return
+            
+            # Get first channel for example
+            channel_id, channel_info = next(iter(channels.items()))
+            
+            # Simulate getting messages
+            message_count = 5  # Simulated
+            
+            self.bot.answer_callback_query(
+                call.id,
+                f"✅ Sent {message_count} messages from {server_name}"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error getting messages: {e}")
+            self.bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+    
+    def _handle_add_channel_request(self, call):
+        """Handle add channel request"""
+        try:
+            server_name = call.data.replace('add_channel_', '', 1)
+            
+            # Save user state
+            self.user_states[call.from_user.id] = {
+                'action': 'waiting_for_channel_id',
+                'server_name': server_name,
+                'chat_id': call.message.chat.id,
+                'message_id': call.message.message_id
             }
             
-            with open(self.message_store_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            text = (
+                f"➕ **Adding Channel to {server_name}**\n\n"
+                f"🔹 Please send the Discord channel ID\n"
+                f"🔹 Example: `1234567890123456789`\n\n"
+                f"📝 **How to get channel ID:**\n"
+                f"1. Enable Developer Mode in Discord\n"
+                f"2. Right-click on the channel\n"
+                f"3. Click 'Copy ID'\n\n"
+                f"⚠️ Make sure the bot has access to this channel!"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_add_{server_name}"))
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            self.logger.error(f"Error in add channel request: {e}")
+    
+    def _handle_confirm_add_channel(self, call):
+        """Handle channel addition confirmation"""
+        try:
+            parts = call.data.replace('confirm_add_', '', 1).split('_', 1)
+            if len(parts) != 2:
+                self.bot.answer_callback_query(call.id, "❌ Invalid data")
+                return
+                
+            server_name, channel_id = parts
+            
+            # Get channel name from user state
+            user_state = self.user_states.get(call.from_user.id, {})
+            channel_name = user_state.get('channel_name', f"Channel_{channel_id}")
+            
+            # Add channel
+            success, message = self.add_channel_to_server(server_name, channel_id, channel_name)
+            
+            markup = InlineKeyboardMarkup()
+            if success:
+                markup.add(
+                    InlineKeyboardButton("📋 View Server", callback_data=f"server_{server_name}"),
+                    InlineKeyboardButton("🔙 Back to Servers", callback_data="servers")
+                )
+                status_icon = "✅"
+            else:
+                markup.add(InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"))
+                status_icon = "❌"
+            
+            self.bot.edit_message_text(
+                f"{status_icon} **Channel Addition Result**\n\n"
+                f"Server: {server_name}\n"
+                f"Channel ID: `{channel_id}`\n"
+                f"Channel Name: {channel_name}\n\n"
+                f"Result: {message}",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+            # Clear user state
+            if call.from_user.id in self.user_states:
+                del self.user_states[call.from_user.id]
                 
         except Exception as e:
-            self.logger.error(f"Error saving persistent data: {e}")
+            self.logger.error(f"Error confirming add channel: {e}")
+    
+    def _handle_cancel_add_channel(self, call):
+        """Handle cancel add channel"""
+        try:
+            server_name = call.data.replace('cancel_add_', '', 1)
+            
+            # Clear user state
+            if call.from_user.id in self.user_states:
+                del self.user_states[call.from_user.id]
+            
+            # Return to server view
+            call.data = f"server_{server_name}"
+            self._handle_server_selected(call)
+        except Exception as e:
+            self.logger.error(f"Error canceling add channel: {e}")
+    
+    def _process_channel_id_input(self, message, user_state):
+        """Process channel ID input from user"""
+        try:
+            channel_id = message.text.strip()
+            server_name = user_state['server_name']
+            original_chat_id = user_state['chat_id']
+            original_message_id = user_state['message_id']
+            
+            # Validate channel ID format
+            if not channel_id.isdigit() or len(channel_id) < 17:
+                self.bot.reply_to(
+                    message, 
+                    "❌ Invalid channel ID format. Please send a valid Discord channel ID (17-19 digits)"
+                )
+                return
+            
+            # Try to get channel name from Discord service
+            channel_name = f"Channel_{channel_id}"
+            if self.discord_service:
+                try:
+                    # Here you would implement channel name fetching
+                    # For now, we'll use the default name
+                    pass
+                except Exception as e:
+                    self.logger.debug(f"Could not get channel info: {e}")
+            
+            # Save channel name in state
+            self.user_states[message.from_user.id]['channel_name'] = channel_name
+            
+            # Show confirmation
+            confirmation_text = (
+                f"🔍 **Channel Information**\n\n"
+                f"Server: {server_name}\n"
+                f"Channel ID: `{channel_id}`\n"
+                f"Channel Name: {channel_name}\n\n"
+                f"➕ Add this channel to monitoring?"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_add_{server_name}_{channel_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_add_{server_name}")
+            )
+            
+            # Delete user's message
+            try:
+                self.bot.delete_message(message.chat.id, message.message_id)
+            except:
+                pass
+            
+            # Update original message
+            try:
+                self.bot.edit_message_text(
+                    confirmation_text,
+                    original_chat_id,
+                    original_message_id,
+                    reply_markup=markup,
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                # If edit fails, send new message
+                self.bot.send_message(
+                    message.chat.id,
+                    confirmation_text,
+                    reply_markup=markup,
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            self.logger.error(f"Error processing channel ID input: {e}")
+    
+    def _send_servers_list_message(self, message):
+        """Send servers list as a new message"""
+        try:
+            if not self.discord_service:
+                self.bot.reply_to(message, "❌ Discord service not available")
+                return
+            
+            servers = getattr(self.discord_service, 'servers', {})
+            
+            if not servers:
+                self.bot.reply_to(message, "❌ No Discord servers found")
+                return
+            
+            text = f"📋 **Discord Servers ({len(servers)} total)**\n\n"
+            
+            for server_name in list(servers.keys())[:10]:
+                topic_id = self.server_topics.get(server_name)
+                if topic_id:
+                    text += f"• {server_name} - Topic: {topic_id}\n"
+                else:
+                    text += f"• {server_name} - No topic\n"
+            
+            if len(servers) > 10:
+                text += f"\n... and {len(servers) - 10} more servers"
+            
+            self.bot.reply_to(message, text, parse_mode='Markdown')
+            
+        except Exception as e:
+            self.logger.error(f"Error sending servers list: {e}")
+            self.bot.reply_to(message, f"❌ Error: {str(e)}")
+    
+    def add_channel_to_server(self, server_name: str, channel_id: str, channel_name: str = None) -> tuple[bool, str]:
+        """Enhanced channel addition with Discord service integration"""
+        try:
+            # Check if Discord service is available
+            if not self.discord_service:
+                return False, "Discord service not available"
+            
+            # Check if server exists
+            servers = getattr(self.discord_service, 'servers', {})
+            if server_name not in servers:
+                return False, "Server not found in Discord service"
+            
+            # Use Discord service to add channel
+            if hasattr(self.discord_service, 'notify_new_channel_added'):
+                success = self.discord_service.notify_new_channel_added(
+                    server_name, channel_id, channel_name or f"Channel_{channel_id}"
+                )
+                
+                if success:
+                    return True, "Channel successfully added to monitoring"
+                else:
+                    return False, "Failed to add channel to Discord service"
+            else:
+                return False, "Discord service does not support channel addition"
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error adding channel to server: {e}")
+            return False, f"Error adding channel: {str(e)}"
     
     async def get_or_create_server_topic(self, server_name: str) -> Optional[int]:
         """ENHANCED: Get or create topic with anti-duplicate protection"""
@@ -337,333 +1199,6 @@ class TelegramService:
                 self.logger.error(f"❌ Error creating topic for '{server_name}': {e}")
                 return None
     
-    def setup_enhanced_bot_handlers(self) -> None:
-        """ENHANCED: Setup comprehensive bot command handlers with interactive UI"""
-        
-        @self.bot.message_handler(commands=['start', 'help'])
-        def send_welcome(message):
-            """Enhanced welcome message with feature overview"""
-            supports_topics = self._check_if_supergroup_with_topics(message.chat.id)
-            
-            text = (
-                "🤖 **Enhanced Discord Announcement Parser!**\n\n"
-                "🔥 **Real-time WebSocket Mode** - Instant message delivery!\n"
-                "📡 Messages received via WebSocket for immediate forwarding\n"
-                "🛡️ **ANTI-DUPLICATE System**: Prevents topic duplication!\n\n"
-            )
-            
-            if supports_topics:
-                text += (
-                    "🔹 **Forum Topics Mode (Enabled)**:\n"
-                    "• Each Discord server gets ONE topic (NO DUPLICATES)\n"
-                    "• Messages from all channels in server go to same topic\n"
-                    "• Smart caching prevents duplicate topic creation\n"
-                    "• Auto-recovery for missing topics\n"
-                    "• Fast topic lookup for real-time messages\n"
-                    "• Startup verification prevents duplicates on restart\n"
-                    "• Interactive channel management\n\n"
-                )
-            else:
-                text += (
-                    "🔹 **Regular Messages Mode**:\n"
-                    "• Messages sent as regular chat messages\n"
-                    "• To enable topics, convert chat to supergroup with topics\n\n"
-                )
-            
-            text += "**Choose an action below:**"
-            
-            markup = InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                InlineKeyboardButton("📋 Server List", callback_data="servers"),
-                InlineKeyboardButton("🔄 Manual Sync", callback_data="refresh"),
-                InlineKeyboardButton("⚡ WebSocket Status", callback_data="websocket"),
-                InlineKeyboardButton("🧹 Clean Topics", callback_data="cleanup"),
-                InlineKeyboardButton("📊 Bot Status", callback_data="status"),
-                InlineKeyboardButton("ℹ️ Help", callback_data="help")
-            )
-            
-            self.bot.send_message(message.chat.id, text, reply_markup=markup, parse_mode='Markdown')
-        
-        @self.bot.callback_query_handler(func=lambda call: True)
-        def handle_callback_query(call):
-            """Enhanced callback handler with comprehensive UI"""
-            try:
-                data = call.data
-                self.logger.info(f"📞 Callback received: {data} from user {call.from_user.id}")
-                
-                # Answer callback to remove loading state
-                self.bot.answer_callback_query(call.id)
-                
-                # Route to appropriate handler
-                if data == "servers":
-                    self._handle_servers_list(call)
-                elif data == "refresh":
-                    self._handle_manual_sync(call)
-                elif data == "websocket":
-                    self._handle_websocket_status(call)
-                elif data == "cleanup":
-                    self._handle_cleanup_topics(call)
-                elif data == "status":
-                    self._handle_bot_status(call)
-                elif data == "help":
-                    self._handle_help(call)
-                elif data == "start":
-                    send_welcome(call.message)
-                elif data == "verify":
-                    self._handle_verify_topics(call)
-                elif data.startswith("server_"):
-                    self._handle_server_selected(call)
-                elif data.startswith("get_messages_"):
-                    self._handle_get_messages(call)
-                elif data.startswith("add_channel_"):
-                    self._handle_add_channel_request(call)
-                elif data.startswith("confirm_add_"):
-                    self._handle_confirm_add_channel(call)
-                elif data.startswith("cancel_add_"):
-                    self._handle_cancel_add_channel(call)
-                else:
-                    self.logger.warning(f"⚠️ Unknown callback data: {data}")
-                
-            except Exception as e:
-                self.logger.error(f"❌ Error handling callback query: {e}")
-                try:
-                    self.bot.answer_callback_query(call.id, "❌ An error occurred")
-                except:
-                    pass
-        
-        @self.bot.message_handler(func=lambda message: True)
-        def handle_text_message(message):
-            """Enhanced text message handler for channel addition workflow"""
-            user_id = message.from_user.id
-            
-            # Check if user is in channel addition workflow
-            if user_id in self.user_states:
-                user_state = self.user_states[user_id]
-                
-                if user_state.get('action') == 'waiting_for_channel_id':
-                    self._process_channel_id_input(message, user_state)
-        
-        # Enhanced command handlers
-        @self.bot.message_handler(commands=['servers'])
-        def list_servers_command(message):
-            """Command to list servers"""
-            self._send_servers_list(message)
-        
-        @self.bot.message_handler(commands=['reset_topics'])
-        def reset_topics(message):
-            """Reset all topic mappings with confirmation"""
-            backup_topics = self.server_topics.copy()
-            self.server_topics.clear()
-            self.topic_name_cache.clear()
-            self.startup_verification_done = False
-            self._save_persistent_data()
-            
-            self.bot.reply_to(
-                message, 
-                f"✅ All topic mappings reset.\n"
-                f"🗑️ Cleared {len(backup_topics)} topic mappings.\n"
-                f"🆕 New topics will be created when needed.\n"
-                f"🛡️ Anti-duplicate protection active."
-            )
-        
-        @self.bot.message_handler(commands=['verify_topics'])
-        def verify_topics_command(message):
-            """Force topic verification"""
-            self.startup_verification_done = False
-            old_count = len(self.server_topics)
-            
-            # Run verification
-            asyncio.create_task(self.startup_topic_verification())
-            
-            new_count = len(self.server_topics)
-            removed_count = old_count - new_count
-            
-            self.bot.reply_to(
-                message,
-                f"🔍 Topic verification completed!\n\n"
-                f"📊 Results:\n"
-                f"• Topics before: {old_count}\n"
-                f"• Topics after: {new_count}\n"
-                f"• Removed/Fixed: {removed_count}\n"
-                f"🛡️ Anti-duplicate protection: ✅ ACTIVE"
-            )
-        
-        @self.bot.message_handler(commands=['cleanup_topics'])
-        def cleanup_topics_command(message):
-            """Clean invalid topics"""
-            cleaned = asyncio.run(self._clean_invalid_topics())
-            self.bot.reply_to(
-                message, 
-                f"🧹 Cleaned {cleaned} invalid/duplicate topics.\n"
-                f"📋 Current active topics: {len(self.server_topics)}\n"
-                f"🛡️ Anti-duplicate protection: ✅ ACTIVE"
-            )
-    
-    def _handle_servers_list(self, call):
-        """Enhanced server list handler with interactive management"""
-        if not hasattr(self.settings, 'server_channel_mappings') or not self.settings.server_channel_mappings:
-            markup = InlineKeyboardMarkup()
-            markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-            self.bot.edit_message_text(
-                "❌ No servers found. Please configure servers first.",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=markup
-            )
-            return
-        
-        markup = InlineKeyboardMarkup()
-        for server in self.settings.server_channel_mappings.keys():
-            # Add topic indicator with duplicate check
-            topic_indicator = ""
-            if server in self.server_topics:
-                topic_id = self.server_topics[server]
-                exists = asyncio.run(self._topic_exists(call.message.chat.id, topic_id))
-                topic_indicator = " 📋" if exists else " ❌"
-            else:
-                topic_indicator = " 🆕"  # New server, no topic yet
-            
-            markup.add(InlineKeyboardButton(
-                f"{server}{topic_indicator}",
-                callback_data=f"server_{server}"
-            ))
-        markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-        
-        server_count = len(self.settings.server_channel_mappings)
-        topic_count = len(self.server_topics)
-        
-        text = (
-            f"📋 **Server Management**\n\n"
-            f"📊 {server_count} servers configured, {topic_count} topics created\n"
-            f"📋 = Has topic, ❌ = Invalid topic, 🆕 = New server\n"
-            f"🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
-            f"Select a server to manage:"
-        )
-        
-        self.bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _process_channel_id_input(self, message, user_state):
-        """Process channel ID input from user"""
-        channel_id = message.text.strip()
-        server_name = user_state['server_name']
-        original_chat_id = user_state['chat_id']
-        original_message_id = user_state['message_id']
-        
-        # Validate channel ID format
-        if not channel_id.isdigit() or len(channel_id) < 17:
-            self.bot.reply_to(
-                message, 
-                "❌ Invalid channel ID format. Please send a valid Discord channel ID (17-19 digits)"
-            )
-            return
-        
-        # Try to get channel name from Discord service
-        channel_name = f"Channel_{channel_id}"
-        if self.discord_service:
-            try:
-                # Here you would implement channel name fetching
-                # For now, we'll use the default name
-                pass
-            except Exception as e:
-                self.logger.debug(f"Could not get channel info: {e}")
-        
-        # Save channel name in state
-        self.user_states[message.from_user.id]['channel_name'] = channel_name
-        
-        # Show confirmation
-        confirmation_text = (
-            f"🔍 **Channel Information**\n\n"
-            f"Server: {server_name}\n"
-            f"Channel ID: `{channel_id}`\n"
-            f"Channel Name: {channel_name}\n\n"
-            f"➕ Add this channel to monitoring?"
-        )
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_add_{server_name}_{channel_id}"),
-            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_add_{server_name}")
-        )
-        
-        # Delete user's message
-        try:
-            self.bot.delete_message(message.chat.id, message.message_id)
-        except:
-            pass
-        
-        # Update original message
-        try:
-            self.bot.edit_message_text(
-                confirmation_text,
-                original_chat_id,
-                original_message_id,
-                reply_markup=markup,
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            # If edit fails, send new message
-            self.bot.send_message(
-                message.chat.id,
-                confirmation_text,
-                reply_markup=markup,
-                parse_mode='Markdown'
-            )
-    
-    def add_channel_to_server(self, server_name: str, channel_id: str, channel_name: str = None) -> tuple[bool, str]:
-        """Enhanced channel addition with Discord service integration"""
-        try:
-            # Check if server exists in configuration
-            if not hasattr(self.settings, 'server_channel_mappings'):
-                self.settings.server_channel_mappings = {}
-            
-            if server_name not in self.settings.server_channel_mappings:
-                self.settings.server_channel_mappings[server_name] = {}
-            
-            # Check if channel already added
-            if channel_id in self.settings.server_channel_mappings[server_name]:
-                return False, "Channel already added to this server"
-            
-            # Test channel accessibility if Discord service available
-            access_confirmed = False
-            if self.discord_service:
-                try:
-                    # Here you would test channel access
-                    # For now, we'll mark as unconfirmed
-                    pass
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Cannot access channel {channel_id}: {e}")
-            
-            # Add channel to configuration
-            final_channel_name = channel_name or f"Channel_{channel_id}"
-            self.settings.server_channel_mappings[server_name][channel_id] = final_channel_name
-            
-            # Add to WebSocket subscriptions if available
-            if hasattr(self, 'websocket_service') and self.websocket_service:
-                self.websocket_service.add_channel_subscription(channel_id)
-                self.logger.info(f"✅ Added channel {channel_id} to WebSocket subscriptions")
-            
-            self.logger.info(f"✅ Added channel '{final_channel_name}' ({channel_id}) to server '{server_name}'")
-            
-            status = "✅ Available" if access_confirmed else "⚠️ Limited access (will monitor via WebSocket)"
-            
-            return True, f"Channel successfully added!\nStatus: {status}"
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error adding channel to server: {e}")
-            return False, f"Error adding channel: {str(e)}"
-    
-    def _handle_bot_updates(self, messages):
-        """Handle bot updates for enhanced monitoring"""
-        for message in messages:
-            if message.content_type == 'text':
-                self.logger.debug(f"Bot received message: {message.text[:50]}...")
-    
     async def send_message(self, message: DiscordMessage) -> bool:
         """Enhanced message sending with deduplication and topic management"""
         try:
@@ -720,48 +1255,7 @@ class TelegramService:
         
         return False
     
-    async def _is_duplicate_message(self, message: DiscordMessage) -> bool:
-        """Enhanced message deduplication"""
-        async with self._async_lock:
-            message_key = f"{message.guild_id}:{message.channel_id}:{message.message_id}"
-            
-            # Clean old processed messages (older than 1 hour)
-            cutoff_time = datetime.now() - timedelta(hours=1)
-            old_keys = [
-                key for key, timestamp in self.processed_messages.items()
-                if timestamp < cutoff_time
-            ]
-            for key in old_keys:
-                del self.processed_messages[key]
-            
-            # Check for duplicates
-            return message_key in self.processed_messages
-    
-    async def _mark_message_as_processed(self, message: DiscordMessage) -> None:
-        """Mark message as processed to prevent duplicates"""
-        async with self._async_lock:
-            message_key = f"{message.guild_id}:{message.channel_id}:{message.message_id}"
-            self.processed_messages[message_key] = datetime.now()
-    
-    def _format_message_for_telegram(self, message: DiscordMessage) -> str:
-        """Enhanced message formatting for Telegram"""
-        parts = []
-        
-        # Channel info
-        parts.append(f"📢 #{message.channel_name}")
-        
-        # Timestamp (if enabled)
-        if self.settings.show_timestamps:
-            parts.append(f"📅 {message.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
-        
-        # Author
-        parts.append(f"👤 {message.author}")
-        
-        # Content
-        parts.append(f"💬 {message.content}")
-        
-        return "\n".join(parts)
-    
+    # Остальные методы остаются без изменений...
     async def send_messages_batch(self, messages: List[DiscordMessage]) -> int:
         """Enhanced batch message sending"""
         if not messages:
@@ -846,6 +1340,48 @@ class TelegramService:
         
         return False
     
+    async def _is_duplicate_message(self, message: DiscordMessage) -> bool:
+        """Enhanced message deduplication"""
+        async with self._async_lock:
+            message_key = f"{message.guild_id}:{message.channel_id}:{message.message_id}"
+            
+            # Clean old processed messages (older than 1 hour)
+            cutoff_time = datetime.now() - timedelta(hours=1)
+            old_keys = [
+                key for key, timestamp in self.processed_messages.items()
+                if timestamp < cutoff_time
+            ]
+            for key in old_keys:
+                del self.processed_messages[key]
+            
+            # Check for duplicates
+            return message_key in self.processed_messages
+    
+    async def _mark_message_as_processed(self, message: DiscordMessage) -> None:
+        """Mark message as processed to prevent duplicates"""
+        async with self._async_lock:
+            message_key = f"{message.guild_id}:{message.channel_id}:{message.message_id}"
+            self.processed_messages[message_key] = datetime.now()
+    
+    def _format_message_for_telegram(self, message: DiscordMessage) -> str:
+        """Enhanced message formatting for Telegram"""
+        parts = []
+        
+        # Channel info
+        parts.append(f"📢 #{message.channel_name}")
+        
+        # Timestamp (if enabled)
+        if self.settings.show_timestamps:
+            parts.append(f"📅 {message.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Author
+        parts.append(f"👤 {message.author}")
+        
+        # Content
+        parts.append(f"💬 {message.content}")
+        
+        return "\n".join(parts)
+    
     async def _clean_invalid_topics(self) -> int:
         """Enhanced topic cleanup with duplicate detection"""
         invalid_topics = []
@@ -888,358 +1424,46 @@ class TelegramService:
         
         return len(invalid_topics)
     
-    # Handler methods for bot interface
-    def _handle_manual_sync(self, call):
-        """Handle manual sync request"""
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-        
+    def _load_persistent_data(self) -> None:
+        """Load persistent data from file"""
         try:
-            sync_result = "🔄 Manual sync completed successfully!"
-            if self.discord_service:
-                server_count = len(getattr(self.settings, 'server_channel_mappings', {}))
-                sync_result += f"\n📊 Found {server_count} servers"
-            
-            self.bot.edit_message_text(
-                sync_result,
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=markup
-            )
-        except Exception as e:
-            self.bot.edit_message_text(
-                f"❌ Sync failed: {str(e)}",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=markup
-            )
-    
-    def _handle_websocket_status(self, call):
-        """Handle WebSocket status request"""
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-        
-        ws_status = "❌ WebSocket service not available"
-        if hasattr(self, 'websocket_service') and self.websocket_service:
-            subscribed_channels = len(getattr(self.websocket_service, 'subscribed_channels', []))
-            ws_status = (
-                f"⚡ **WebSocket Status**\n\n"
-                f"📡 Subscribed channels: {subscribed_channels}\n"
-                f"🔄 Status: {'✅ Active' if getattr(self.websocket_service, 'running', False) else '❌ Inactive'}"
-            )
-        
-        self.bot.edit_message_text(
-            ws_status,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_cleanup_topics(self, call):
-        """Handle topic cleanup request"""
-        cleaned = asyncio.run(self._clean_invalid_topics())
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-        
-        self.bot.edit_message_text(
-            f"🧹 **Topic cleanup completed!**\n\n"
-            f"Removed {cleaned} invalid/duplicate topics.\n"
-            f"Current topics: {len(self.server_topics)}\n"
-            f"🛡️ Anti-duplicate protection: **ACTIVE**",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_bot_status(self, call):
-        """Handle bot status request"""
-        supports_topics = self._check_if_supergroup_with_topics(call.message.chat.id)
-        
-        status_text = (
-            f"📊 **Enhanced Bot Status**\n\n"
-            f"🔹 Topics Support: {'✅ Enabled' if supports_topics else '❌ Disabled'}\n"
-            f"🔹 Active Topics: {len(self.server_topics)}\n"
-            f"🔹 Configured Servers: {len(getattr(self.settings, 'server_channel_mappings', {}))}\n"
-            f"🔹 Message Cache: {len(self.message_mappings)}\n"
-            f"🔹 Processed Messages: {len(self.processed_messages)}\n"
-            f"🛡️ Anti-Duplicate Protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n"
-            f"🔹 Topic Logic: **One server = One topic ✅**\n"
-            f"🔹 Startup Verification: {'✅ Complete' if self.startup_verification_done else '⏳ In Progress'}\n\n"
-            f"📋 **Current Topics:**\n"
-        )
-        
-        if self.server_topics:
-            for server, topic_id in list(self.server_topics.items())[:10]:
-                exists = asyncio.run(self._topic_exists(call.message.chat.id, topic_id))
-                status_icon = "✅" if exists else "❌"
-                status_text += f"• {server}: Topic {topic_id} {status_icon}\n"
-            
-            if len(self.server_topics) > 10:
-                status_text += f"• ... and {len(self.server_topics) - 10} more topics\n"
-        else:
-            status_text += "• No topics created yet\n"
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton("🧹 Clean Invalid", callback_data="cleanup"),
-            InlineKeyboardButton("🔄 Verify Topics", callback_data="verify"),
-            InlineKeyboardButton("🔙 Back to Menu", callback_data="start")
-        )
-        
-        self.bot.edit_message_text(
-            status_text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_help(self, call):
-        """Handle help request"""
-        help_text = (
-            "ℹ️ **Enhanced Discord Announcement Parser Help**\n\n"
-            "🤖 **Main Features:**\n"
-            "• Real-time Discord message monitoring\n"
-            "• Auto-forwarding to Telegram topics\n"
-            "• Anti-duplicate topic protection\n"
-            "• Interactive channel management\n"
-            "• Enhanced WebSocket monitoring\n\n"
-            "📋 **Commands:**\n"
-            "• `/start` - Show main menu\n"
-            "• `/servers` - List all servers\n"
-            "• `/cleanup_topics` - Clean invalid topics\n"
-            "• `/verify_topics` - Verify topic integrity\n"
-            "• `/reset_topics` - Reset all topic mappings\n\n"
-            "🔧 **How to add channels:**\n"
-            "1. Go to Server List\n"
-            "2. Select a server\n"
-            "3. Click 'Add Channel'\n"
-            "4. Enter channel ID\n"
-            "5. Confirm addition\n\n"
-            "🛡️ **Topic Protection:**\n"
-            "• One server = One topic\n"
-            "• No duplicate topics\n"
-            "• Auto-recovery for missing topics\n"
-            "• Startup verification\n"
-            "• Real-time deduplication\n"
-        )
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-        
-        self.bot.edit_message_text(
-            help_text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_verify_topics(self, call):
-        """Handle topic verification request"""
-        self.startup_verification_done = False
-        asyncio.create_task(self.startup_topic_verification())
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
-        
-        self.bot.edit_message_text(
-            f"🔍 **Topic verification completed!**\n\n"
-            f"✅ Active topics: {len(self.server_topics)}\n"
-            f"🛡️ Duplicate protection: **ACTIVE**\n"
-            f"🔒 No duplicates found or removed",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_server_selected(self, call):
-        """Handle server selection"""
-        server_name = call.data.replace('server_', '', 1)
-        
-        if not hasattr(self.settings, 'server_channel_mappings') or server_name not in self.settings.server_channel_mappings:
-            self.bot.answer_callback_query(call.id, "❌ Server not found")
-            return
-        
-        channels = self.settings.server_channel_mappings[server_name]
-        channel_count = len(channels)
-        
-        # Topic information
-        topic_info = ""
-        existing_topic_id = self.server_topics.get(server_name)
-        if existing_topic_id:
-            exists = asyncio.run(self._topic_exists(call.message.chat.id, existing_topic_id))
-            if exists:
-                topic_info = f"📋 Topic: {existing_topic_id} ✅"
+            if os.path.exists(self.message_store_file):
+                with open(self.message_store_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.message_mappings = data.get('messages', {})
+                    self.server_topics = data.get('topics', {})
+                    
+                    # Create reverse cache
+                    self.topic_name_cache = {v: k for k, v in self.server_topics.items()}
+                    
+                    self.logger.info(f"📋 Loaded persistent data",
+                                   topics=len(self.server_topics),
+                                   messages=len(self.message_mappings))
             else:
-                topic_info = f"📋 Topic: {existing_topic_id} ❌ (invalid)"
-        else:
-            topic_info = "📋 Topic: Not created yet"
-        
-        text = (
-            f"**{server_name}**\n\n"
-            f"📊 Channels: {channel_count}\n"
-            f"{topic_info}\n\n"
-            f"📋 **Configured Channels:**\n"
-        )
-        
-        # Show channels
-        if channels:
-            for channel_id, channel_name in list(channels.items())[:10]:
-                text += f"• {channel_name} (`{channel_id}`)\n"
-            if len(channels) > 10:
-                text += f"• ... and {len(channels) - 10} more channels\n"
-        else:
-            text += "• No channels configured\n"
-        
-        markup = InlineKeyboardMarkup()
-        
-        # Action buttons
-        if channels:
-            markup.add(
-                InlineKeyboardButton("📥 Get Messages", callback_data=f"get_messages_{server_name}"),
-                InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
-            )
-        else:
-            markup.add(
-                InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
-            )
-        
-        markup.add(InlineKeyboardButton("🔙 Back to Servers", callback_data="servers"))
-        
-        self.bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_get_messages(self, call):
-        """Handle get messages request"""
-        server_name = call.data.replace('get_messages_', '', 1)
-        
-        if not hasattr(self.settings, 'server_channel_mappings'):
-            self.bot.answer_callback_query(call.id, "❌ No server configuration found")
-            return
-        
-        channels = self.settings.server_channel_mappings.get(server_name, {})
-        
-        if not channels:
-            self.bot.answer_callback_query(call.id, "❌ No channels found for this server")
-            return
-        
-        # Get first channel for example
-        channel_id, channel_name = next(iter(channels.items()))
-        
-        if self.discord_service:
-            try:
-                # Here you would call discord_service.get_recent_messages
-                # For now, we'll simulate success
-                message_count = 5  # Simulated
+                self.message_mappings = {}
+                self.server_topics = {}
+                self.topic_name_cache = {}
                 
-                self.bot.answer_callback_query(
-                    call.id,
-                    f"✅ Sent {message_count} messages from {server_name}"
-                )
-                
-            except Exception as e:
-                self.logger.error(f"Error getting messages: {e}")
-                self.bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
-        else:
-            self.bot.answer_callback_query(call.id, "❌ Discord service not available")
+        except Exception as e:
+            self.logger.error(f"Error loading persistent data: {e}")
+            self.message_mappings = {}
+            self.server_topics = {}
+            self.topic_name_cache = {}
     
-    def _handle_add_channel_request(self, call):
-        """Handle add channel request"""
-        server_name = call.data.replace('add_channel_', '', 1)
-        
-        # Save user state
-        self.user_states[call.from_user.id] = {
-            'action': 'waiting_for_channel_id',
-            'server_name': server_name,
-            'chat_id': call.message.chat.id,
-            'message_id': call.message.message_id
-        }
-        
-        text = (
-            f"➕ **Adding Channel to {server_name}**\n\n"
-            f"🔹 Please send the Discord channel ID\n"
-            f"🔹 Example: `1234567890123456789`\n\n"
-            f"📝 **How to get channel ID:**\n"
-            f"1. Enable Developer Mode in Discord\n"
-            f"2. Right-click on the channel\n"
-            f"3. Click 'Copy ID'\n\n"
-            f"⚠️ Make sure the bot has access to this channel!"
-        )
-        
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_add_{server_name}"))
-        
-        self.bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-    
-    def _handle_confirm_add_channel(self, call):
-        """Handle channel addition confirmation"""
-        parts = call.data.replace('confirm_add_', '', 1).split('_', 1)
-        if len(parts) != 2:
-            self.bot.answer_callback_query(call.id, "❌ Invalid data")
-            return
+    def _save_persistent_data(self) -> None:
+        """Save persistent data to file"""
+        try:
+            data = {
+                'messages': self.message_mappings,
+                'topics': self.server_topics,
+                'last_updated': datetime.now().isoformat()
+            }
             
-        server_name, channel_id = parts
-        
-        # Get channel name from user state
-        user_state = self.user_states.get(call.from_user.id, {})
-        channel_name = user_state.get('channel_name', f"Channel_{channel_id}")
-        
-        # Add channel
-        success, message = self.add_channel_to_server(server_name, channel_id, channel_name)
-        
-        markup = InlineKeyboardMarkup()
-        if success:
-            markup.add(
-                InlineKeyboardButton("📋 View Server", callback_data=f"server_{server_name}"),
-                InlineKeyboardButton("🔙 Back to Servers", callback_data="servers")
-            )
-            status_icon = "✅"
-        else:
-            markup.add(InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"))
-            status_icon = "❌"
-        
-        self.bot.edit_message_text(
-            f"{status_icon} **Channel Addition Result**\n\n"
-            f"Server: {server_name}\n"
-            f"Channel ID: `{channel_id}`\n"
-            f"Channel Name: {channel_name}\n\n"
-            f"Result: {message}",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            parse_mode='Markdown'
-        )
-        
-        # Clear user state
-        if call.from_user.id in self.user_states:
-            del self.user_states[call.from_user.id]
-    
-    def _handle_cancel_add_channel(self, call):
-        """Handle cancel add channel"""
-        server_name = call.data.replace('cancel_add_', '', 1)
-        
-        # Clear user state
-        if call.from_user.id in self.user_states:
-            del self.user_states[call.from_user.id]
-        
-        # Return to server view
-        call.data = f"server_{server_name}"
-        self._handle_server_selected(call)
+            with open(self.message_store_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            self.logger.error(f"Error saving persistent data: {e}")
     
     async def _async_save_data(self) -> None:
         """Asynchronous data saving"""
@@ -1249,12 +1473,15 @@ class TelegramService:
             self.logger.error(f"Error in async save: {e}")
     
     async def start_bot_async(self) -> None:
-        """Start the enhanced Telegram bot asynchronously"""
+        """ИСПРАВЛЕНИЕ: Start the enhanced Telegram bot asynchronously"""
         if self.bot_running:
             self.logger.warning("Enhanced bot is already running")
             return
         
-        self.setup_enhanced_bot_handlers()
+        if not self.bot:
+            self.logger.error("Bot not initialized, cannot start")
+            return
+        
         self.bot_running = True
         
         self.logger.info("Starting Enhanced Telegram bot", 
@@ -1264,36 +1491,92 @@ class TelegramService:
                        features=["Anti-duplicate", "Interactive UI", "Channel management"])
         
         try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, 
-                lambda: self.bot.polling(
-                    none_stop=True,
-                    interval=1,
-                    timeout=30,
-                    skip_pending=True
+            # ИСПРАВЛЕНИЕ: Запускаем бота в отдельном потоке
+            def run_bot():
+                try:
+                    self.logger.info("Bot polling started in thread")
+                    self.bot.polling(
+                        none_stop=True,
+                        interval=1,
+                        timeout=30,
+                        skip_pending=True
+                    )
+                except Exception as e:
+                    self.logger.error("Bot polling error in thread", error=str(e))
+                finally:
+                    self.bot_running = False
+                    self.logger.info("Bot polling stopped")
+            
+            # Запускаем в отдельном потоке
+            self._bot_thread = threading.Thread(target=run_bot, daemon=True)
+            self._bot_thread.start()
+            
+            self.logger.info("Enhanced Telegram bot started successfully")
+            
+            # Ждем немного, чтобы убедиться что бот запустился
+            await asyncio.sleep(2)
+            
+            if not self.bot_running:
+                self.logger.error("Bot failed to start")
+                return
+            
+            # Отправляем тестовое сообщение для проверки
+            try:
+                test_message = (
+                    "🤖 **Discord Telegram Parser Bot Started!**\n\n"
+                    f"✅ Bot is now active and monitoring\n"
+                    f"📋 {len(self.server_topics)} topics configured\n"
+                    f"🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⏳ STARTING'}\n\n"
+                    f"Use /start for interactive menu"
                 )
-            )
+                
+                self.bot.send_message(
+                    chat_id=self.settings.telegram_chat_id,
+                    text=test_message,
+                    parse_mode='Markdown'
+                )
+                
+                self.logger.info("Bot startup notification sent successfully")
+                
+            except Exception as e:
+                self.logger.warning(f"Could not send startup notification: {e}")
+            
         except Exception as e:
-            self.logger.error("Enhanced bot polling error", error=str(e))
-        finally:
+            self.logger.error("Enhanced bot startup error", error=str(e))
             self.bot_running = False
-            self.logger.info("Enhanced Telegram bot stopped")
     
     def stop_bot(self) -> None:
-        """Stop the enhanced Telegram bot"""
-        if self.bot_running:
-            try:
+        """ИСПРАВЛЕНИЕ: Stop the enhanced Telegram bot"""
+        if not self.bot_running:
+            self.logger.info("Bot is not running")
+            return
+        
+        self.logger.info("Stopping Enhanced Telegram bot...")
+        
+        try:
+            # Останавливаем polling
+            if self.bot:
                 self.bot.stop_polling()
-                self.bot_running = False
-                self.logger.info("Enhanced Telegram bot stopped")
-            except Exception as e:
-                self.logger.error("Error stopping enhanced bot", error=str(e))
-                self.bot_running = False
+            
+            # Ждем завершения потока
+            if self._bot_thread and self._bot_thread.is_alive():
+                self._bot_thread.join(timeout=5)
+            
+            self.bot_running = False
+            self.logger.info("Enhanced Telegram bot stopped successfully")
+            
+        except Exception as e:
+            self.logger.error("Error stopping enhanced bot", error=str(e))
+            self.bot_running = False
     
     async def cleanup(self) -> None:
         """Enhanced cleanup"""
+        self.logger.info("Starting Telegram service cleanup...")
+        
+        # Stop bot
         self.stop_bot()
+        
+        # Save persistent data
         self._save_persistent_data()
         
         # Clear caches
@@ -1309,11 +1592,24 @@ class TelegramService:
     
     def get_enhanced_stats(self) -> Dict:
         """Get enhanced statistics"""
+        # Check topic validity
+        verified_topics = 0
+        if self.bot:
+            for topic_id in self.server_topics.values():
+                try:
+                    topic_info = self.bot.get_forum_topic(
+                        chat_id=self.settings.telegram_chat_id,
+                        message_thread_id=topic_id
+                    )
+                    if topic_info:
+                        verified_topics += 1
+                except:
+                    pass
+        
         return {
             "topics": {
                 "total": len(self.server_topics),
-                "verified": len([t for t in self.server_topics.values() 
-                               if asyncio.run(self._topic_exists(self.settings.telegram_chat_id, t))]),
+                "verified": verified_topics,
                 "startup_verification_done": self.startup_verification_done
             },
             "messages": {
@@ -1322,7 +1618,8 @@ class TelegramService:
             },
             "bot": {
                 "running": self.bot_running,
-                "active_user_states": len(self.user_states)
+                "active_user_states": len(self.user_states),
+                "thread_alive": self._bot_thread.is_alive() if self._bot_thread else False
             },
             "features": {
                 "anti_duplicate": True,

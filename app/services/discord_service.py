@@ -1,4 +1,4 @@
-# app/services/discord_service.py - FIXED VERSION
+# app/services/discord_service.py - ИСПРАВЛЕННАЯ ВЕРСИЯ (только announcement каналы)
 import aiohttp
 import asyncio
 import json
@@ -13,7 +13,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class DiscordService:
-    """Fixed Discord service with message callback support"""
+    """Исправленный Discord service - только announcement каналы и 5 последних сообщений"""
     
     def __init__(self, 
                  settings: Settings,
@@ -25,20 +25,20 @@ class DiscordService:
         self.redis_client = redis_client
         self.logger = logger or structlog.get_logger(__name__)
         
-        # Session management with better error handling
+        # Session management
         self.sessions: List[aiohttp.ClientSession] = []
         self.current_token_index = 0
         self.token_failure_counts: Dict[int, int] = {}
         
-        self.telegram_service_ref = None  # Reference to Telegram service for cross-service communication
+        self.telegram_service_ref = None
         
         # Server tracking
         self.servers: Dict[str, ServerInfo] = {}
         self.websocket_connections: List[aiohttp.ClientWebSocketResponse] = []
         
-        # FIXED: Initialize message callbacks and monitoring
+        # ИСПРАВЛЕНО: Только announcement каналы
         self.message_callbacks: List[Callable] = []
-        self.monitored_channels: Set[str] = set()
+        self.monitored_announcement_channels: Set[str] = set()  # Только announcement каналы
         
         # State
         self.running = False
@@ -75,17 +75,24 @@ class DiscordService:
             except Exception as e:
                 self.logger.error("Error in message callback", error=str(e))
     
+    def _is_announcement_channel(self, channel_name: str) -> bool:
+        """ИСПРАВЛЕНО: Проверка что канал является announcement"""
+        channel_lower = channel_name.lower()
+        announcement_keywords = ['announcement', 'announcements', 'announce']
+        
+        return any(keyword in channel_lower for keyword in announcement_keywords)
+    
     async def initialize(self) -> bool:
-        """Initialize Discord service with improved token validation"""
+        """Initialize Discord service - только announcement каналы"""
         if self._initialization_done:
             return True
             
-        self.logger.info("Initializing Discord service", 
+        self.logger.info("Initializing Discord service (ANNOUNCEMENT CHANNELS ONLY)", 
                         token_count=len(self.settings.discord_tokens),
                         max_servers=self.settings.max_servers,
                         max_channels_total=self.settings.max_total_channels)
         
-        # Create sessions with better configuration
+        # Create sessions
         successful_tokens = 0
         for i, token in enumerate(self.settings.discord_tokens):
             session = aiohttp.ClientSession(
@@ -115,29 +122,28 @@ class DiscordService:
             self.logger.error("No valid Discord tokens available")
             return False
         
-        # Load server configurations with retry
-        await self._discover_servers_with_retry()
+        # ИСПРАВЛЕНО: Поиск только announcement каналов
+        await self._discover_announcement_channels_only()
         
         self._initialization_done = True
-        self.logger.info("Discord service initialized successfully", 
+        self.logger.info("Discord service initialized (ANNOUNCEMENT ONLY)", 
                         valid_tokens=len(self.sessions),
-                        servers_found=len(self.servers))
+                        servers_found=len(self.servers),
+                        announcement_channels=len(self.monitored_announcement_channels))
         return True
     
     async def _validate_token_with_retry(self, session: aiohttp.ClientSession, token_index: int) -> bool:
-        """Validate token with exponential backoff retry"""
+        """Validate token with retry logic"""
         for attempt in range(self.max_retries):
             try:
-                # Progressive delay between attempts
                 if attempt > 0:
                     delay = min(self.max_delay, self.base_delay * (2 ** attempt))
                     await asyncio.sleep(delay)
                 
                 await self.rate_limiter.wait_if_needed(f"token_validate_{token_index}")
                 
-                # Test basic token validity
                 async with session.get('https://discord.com/api/v9/users/@me') as response:
-                    if response.status == 429:  # Rate limited
+                    if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
                         self.logger.warning("Rate limited during token validation", 
                                           token_index=token_index,
@@ -156,10 +162,10 @@ class DiscordService:
                                         status=response.status,
                                         attempt=attempt + 1)
                         
-                        if response.status in [401, 403]:  # Permanent failures
+                        if response.status in [401, 403]:
                             return False
                         
-                        continue  # Retry for other status codes
+                        continue
                     
                     user_data = await response.json()
                     self.logger.info("Token valid for user", 
@@ -170,10 +176,6 @@ class DiscordService:
                 async with session.get('https://discord.com/api/v9/users/@me/guilds') as guilds_res:
                     if guilds_res.status == 429:
                         retry_after = float(guilds_res.headers.get('Retry-After', 60))
-                        self.logger.warning("Rate limited during guild access test",
-                                          token_index=token_index,
-                                          retry_after=retry_after)
-                        
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(min(retry_after, 60))
                             continue
@@ -181,13 +183,8 @@ class DiscordService:
                             return False
                     
                     if guilds_res.status != 200:
-                        self.logger.error("Guild access test failed",
-                                        token_index=token_index,
-                                        status=guilds_res.status)
-                        
                         if guilds_res.status in [401, 403]:
                             return False
-                        
                         continue
                     
                     guilds = await guilds_res.json()
@@ -213,48 +210,41 @@ class DiscordService:
         
         return False
     
-    async def _discover_servers_with_retry(self) -> None:
-        """Discover servers with improved error handling"""
+    async def _discover_announcement_channels_only(self) -> None:
+        """ИСПРАВЛЕНО: Поиск только announcement каналов"""
         if not self.sessions:
             return
         
+        self.logger.info("🔍 Discovering ANNOUNCEMENT channels only...")
+        
         for attempt in range(self.max_retries):
             try:
-                session = self.sessions[0]  # Use first valid session
+                session = self.sessions[0]
                 
                 await self.rate_limiter.wait_if_needed("discover_guilds")
                 
                 async with session.get('https://discord.com/api/v9/users/@me/guilds') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
-                        self.logger.error("Rate limited during server discovery", 
-                                        retry_after=retry_after,
-                                        attempt=attempt + 1)
-                        
                         await asyncio.sleep(min(retry_after, 60))
                         continue
                     
                     if response.status != 200:
-                        self.logger.error("Failed to fetch guilds", 
-                                        status=response.status,
-                                        attempt=attempt + 1)
-                        
-                        if response.status in [401, 403]:  # Permanent failures
+                        if response.status in [401, 403]:
                             break
                         
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(self.base_delay * (2 ** attempt))
                             continue
-                        
                         break
                     
                     guilds = await response.json()
-                    self.logger.info("Discovered guilds successfully", count=len(guilds))
+                    self.logger.info("Discovered guilds", count=len(guilds))
                     
-                    # Process each guild with error isolation
+                    # Process each guild
                     for guild in guilds[:self.settings.max_servers]:
                         try:
-                            await self._process_guild_with_retry(session, guild)
+                            await self._process_guild_announcement_channels_only(session, guild)
                         except Exception as e:
                             self.logger.error("Failed to process guild", 
                                             guild_id=guild.get('id'),
@@ -262,7 +252,7 @@ class DiscordService:
                                             error=str(e))
                             continue
                     
-                    return  # Success, exit retry loop
+                    return
                     
             except Exception as e:
                 self.logger.error("Server discovery error", 
@@ -274,8 +264,8 @@ class DiscordService:
         
         self.logger.warning("Server discovery completed with some failures")
     
-    async def _process_guild_with_retry(self, session: aiohttp.ClientSession, guild_data: dict) -> None:
-        """Process guild with retry logic"""
+    async def _process_guild_announcement_channels_only(self, session: aiohttp.ClientSession, guild_data: dict) -> None:
+        """ИСПРАВЛЕНО: Обработка только announcement каналов"""
         guild_id = guild_data['id']
         guild_name = guild_data['name']
         
@@ -286,27 +276,16 @@ class DiscordService:
                 async with session.get(f'https://discord.com/api/v9/guilds/{guild_id}/channels') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
-                        self.logger.warning("Rate limited processing guild", 
-                                          guild=guild_name,
-                                          retry_after=retry_after,
-                                          attempt=attempt + 1)
-                        
                         await asyncio.sleep(min(retry_after, 60))
                         continue
                     
                     if response.status != 200:
-                        self.logger.warning("Cannot access guild channels", 
-                                          guild=guild_name, 
-                                          status=response.status,
-                                          attempt=attempt + 1)
-                        
-                        if response.status in [401, 403]:  # Permanent failures
+                        if response.status in [401, 403]:
                             return
                         
                         if attempt < self.max_retries - 1:
                             await asyncio.sleep(self.base_delay * (2 ** attempt))
                             continue
-                        
                         return
                     
                     channels = await response.json()
@@ -318,10 +297,14 @@ class DiscordService:
                         max_channels=self.settings.max_channels_per_server
                     )
                     
-                    # Find announcement channels
-                    announcement_channels = self._find_announcement_channels(channels)
+                    # ИСПРАВЛЕНО: Найти ТОЛЬКО announcement каналы
+                    announcement_channels = self._find_announcement_channels_only(channels)
                     
-                    # Add channels to server
+                    if not announcement_channels:
+                        self.logger.info("No announcement channels found", guild=guild_name)
+                        return
+                    
+                    # Add ONLY announcement channels to server
                     for channel in announcement_channels[:self.settings.max_channels_per_server]:
                         channel_info = ChannelInfo(
                             channel_id=channel['id'],
@@ -329,7 +312,7 @@ class DiscordService:
                             category_id=channel.get('parent_id')
                         )
                         
-                        # Test channel accessibility with retry
+                        # Test channel accessibility
                         channel_info.http_accessible = await self._test_channel_access_with_retry(
                             session, channel['id']
                         )
@@ -337,23 +320,26 @@ class DiscordService:
                         
                         server_info.add_channel(channel_info)
                         
-                        # Add to monitored channels for callback triggering
+                        # Add to monitored announcement channels ONLY
                         if channel_info.http_accessible:
-                            self.monitored_channels.add(channel['id'])
+                            self.monitored_announcement_channels.add(channel['id'])
                     
-                    # Update server stats and status
+                    # Update server stats
                     server_info.update_stats()
                     
-                    # Store server
-                    self.servers[guild_name] = server_info
+                    # Store server ONLY if it has announcement channels
+                    if server_info.accessible_channel_count > 0:
+                        self.servers[guild_name] = server_info
+                        
+                        self.logger.info("Added server with announcement channels", 
+                                       guild=guild_name,
+                                       announcement_channels=len(announcement_channels),
+                                       accessible_announcement_channels=server_info.accessible_channel_count)
+                    else:
+                        self.logger.info("Skipped server - no accessible announcement channels", 
+                                       guild=guild_name)
                     
-                    self.logger.info("Processed guild successfully", 
-                                   guild=guild_name,
-                                   total_channels=len(channels),
-                                   announcement_channels=len(announcement_channels),
-                                   accessible_channels=server_info.accessible_channel_count)
-                    
-                    return  # Success
+                    return
                     
             except Exception as e:
                 self.logger.error("Error processing guild", 
@@ -363,7 +349,28 @@ class DiscordService:
                 
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.base_delay * (2 ** attempt))
-                    
+    
+    def _find_announcement_channels_only(self, channels: List[dict]) -> List[dict]:
+        """ИСПРАВЛЕНО: Найти ТОЛЬКО announcement каналы"""
+        announcement_channels = []
+        
+        for channel in channels:
+            if channel.get('type') not in [0, 5]:  # Text channels and announcement channels
+                continue
+                
+            channel_name = channel['name'].lower()
+            
+            # ИСПРАВЛЕНО: Строгая проверка на announcement
+            announcement_keywords = ['announcement', 'announcements', 'announce']
+            
+            if any(keyword in channel_name for keyword in announcement_keywords):
+                announcement_channels.append(channel)
+                self.logger.info("Found announcement channel", 
+                               channel_name=channel['name'],
+                               channel_id=channel['id'])
+        
+        self.logger.info("Total announcement channels found", count=len(announcement_channels))
+        return announcement_channels
     
     async def _test_channel_access_with_retry(self, session: aiohttp.ClientSession, channel_id: str) -> bool:
         """Test channel access with retry logic"""
@@ -374,10 +381,6 @@ class DiscordService:
                 async with session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
-                        self.logger.debug("Rate limited testing channel access", 
-                                        channel_id=channel_id,
-                                        retry_after=retry_after)
-                        
                         await asyncio.sleep(min(retry_after, 60))
                         continue
                     
@@ -402,31 +405,11 @@ class DiscordService:
         self.rate_limiter.record_error()
         return False
     
-    def _find_announcement_channels(self, channels: List[dict]) -> List[dict]:
-        """Find channels that look like announcement channels"""
-        announcement_channels = []
-        
-        for channel in channels:
-            if channel.get('type') not in [0, 5]:  # Text channels and announcement channels
-                continue
-                
-            channel_name = channel['name'].lower()
-            
-            # Look for announcement-related names
-            announcement_keywords = [
-                'announcement', 'announcements', 'announce'
-            ]
-            
-            if any(keyword in channel_name for keyword in announcement_keywords):
-                announcement_channels.append(channel)
-        
-        return announcement_channels
-    
     async def get_recent_messages(self, 
                                  server_name: str, 
                                  channel_id: str, 
-                                 limit: int = 10) -> List[DiscordMessage]:
-        """Get recent messages with improved error handling"""
+                                 limit: int = 5) -> List[DiscordMessage]:  # ИСПРАВЛЕНО: по умолчанию 5
+        """ИСПРАВЛЕНО: Получить только 5 последних сообщений из announcement каналов"""
         if server_name not in self.servers:
             self.logger.warning("Server not found", server=server_name)
             return []
@@ -439,13 +422,20 @@ class DiscordService:
             return []
         
         channel = server.channels[channel_id]
-        if not channel.http_accessible:
-            self.logger.warning("Channel not accessible via HTTP", 
+        
+        # ИСПРАВЛЕНО: Проверяем что это announcement канал
+        if not self._is_announcement_channel(channel.channel_name):
+            self.logger.warning("Channel is not an announcement channel", 
                               server=server_name, 
                               channel=channel.channel_name)
             return []
         
-        # Use token rotation with failure tracking
+        if not channel.http_accessible:
+            self.logger.warning("Announcement channel not accessible via HTTP", 
+                              server=server_name, 
+                              channel=channel.channel_name)
+            return []
+        
         session = self._get_healthy_session()
         if not session:
             self.logger.error("No healthy sessions available")
@@ -453,13 +443,16 @@ class DiscordService:
         
         messages = []
         
+        # ИСПРАВЛЕНО: Ограничиваем до 5 сообщений максимум
+        actual_limit = min(limit, 5)
+        
         for attempt in range(self.max_retries):
             try:
                 await self.rate_limiter.wait_if_needed(f"messages_{channel_id}")
                 
                 async with session.get(
                     f'https://discord.com/api/v9/channels/{channel_id}/messages',
-                    params={'limit': min(limit, self.settings.max_history_messages)}
+                    params={'limit': actual_limit}
                 ) as response:
                     
                     if response.status == 429:
@@ -478,7 +471,7 @@ class DiscordService:
                                         status=response.status,
                                         attempt=attempt + 1)
                         
-                        if response.status in [401, 403]:  # Permanent failures
+                        if response.status in [401, 403]:
                             self.rate_limiter.record_error()
                             return []
                         
@@ -496,7 +489,7 @@ class DiscordService:
                     for raw_msg in raw_messages:
                         try:
                             if not raw_msg.get('content', '').strip():
-                                continue  # Skip empty messages
+                                continue
                                 
                             message = DiscordMessage(
                                 content=raw_msg['content'],
@@ -523,10 +516,11 @@ class DiscordService:
                     if messages:
                         channel.last_message_time = messages[0].timestamp
                     
-                    self.logger.info("Retrieved messages successfully", 
+                    self.logger.info("Retrieved announcement messages", 
                                    server=server_name,
                                    channel=channel.channel_name,
-                                   message_count=len(messages))
+                                   message_count=len(messages),
+                                   limit_used=actual_limit)
                     
                     return sorted(messages, key=lambda x: x.timestamp)
                     
@@ -549,74 +543,11 @@ class DiscordService:
         self.telegram_service_ref = telegram_service
         self.logger.info("Telegram service reference set for Discord integration")
     
-    def notify_new_channel_added(self, server_name: str, channel_id: str, channel_name: str):
-        """Notify about new channel addition through bot interface"""
-        try:
-            if server_name in self.servers:
-                server_info = self.servers[server_name]
-                
-                # Создаем новый ChannelInfo
-                from ..models.server import ChannelInfo
-                channel_info = ChannelInfo(
-                    channel_id=channel_id,
-                    channel_name=channel_name
-                )
-                
-                # Тестируем доступность канала
-                asyncio.create_task(self._test_and_add_channel(server_info, channel_info))
-                
-                self.logger.info("Channel addition initiated through bot interface",
-                               server=server_name,
-                               channel_id=channel_id,
-                               channel_name=channel_name)
-                
-                return True
-            else:
-                self.logger.warning("Server not found for channel addition", server=server_name)
-                return False
-                
-        except Exception as e:
-            self.logger.error("Error notifying about new channel", error=str(e))
-            return False
-    
-    async def _test_and_add_channel(self, server_info, channel_info):
-        """Test channel accessibility and add to monitoring"""
-        try:
-            # Тестируем доступность канала
-            if self.sessions:
-                session = self.sessions[0]
-                channel_info.http_accessible = await self._test_channel_access_with_retry(
-                    session, channel_info.channel_id
-                )
-                channel_info.last_checked = datetime.now()
-                
-                # Добавляем канал к серверу
-                if server_info.add_channel(channel_info):
-                    # Добавляем к мониторингу
-                    if channel_info.http_accessible:
-                        self.monitored_channels.add(channel_info.channel_id)
-                    
-                    server_info.update_stats()
-                    
-                    self.logger.info("Channel successfully added through bot interface",
-                                   server=server_info.server_name,
-                                   channel=channel_info.channel_name,
-                                   accessible=channel_info.http_accessible)
-                else:
-                    self.logger.warning("Failed to add channel - server at capacity",
-                                      server=server_info.server_name,
-                                      max_channels=server_info.max_channels)
-            
-        except Exception as e:
-            self.logger.error("Error testing and adding channel", error=str(e))
-    
-    
     def _get_healthy_session(self) -> Optional[aiohttp.ClientSession]:
         """Get a healthy session using round-robin with failure tracking"""
         if not self.sessions:
             return None
         
-        # Try to find a session that hasn't failed recently
         attempts = len(self.sessions)
         
         for _ in range(attempts):
@@ -624,7 +555,7 @@ class DiscordService:
             self.current_token_index = (self.current_token_index + 1) % len(self.sessions)
             
             failure_count = self.token_failure_counts.get(session_index, 0)
-            if failure_count < 5:  # Allow sessions with less than 5 recent failures
+            if failure_count < 5:
                 return self.sessions[session_index]
         
         # If all sessions have high failure counts, reset and use the first one
@@ -632,8 +563,8 @@ class DiscordService:
         return self.sessions[0]
     
     async def start_websocket_monitoring(self) -> None:
-        """Start monitoring with HTTP polling (WebSocket disabled due to rate limits)"""
-        self.logger.info("Starting HTTP API polling monitoring")
+        """ИСПРАВЛЕНО: HTTP polling только для announcement каналов"""
+        self.logger.info("Starting HTTP polling for ANNOUNCEMENT channels only")
         
         if not self.sessions:
             self.logger.error("No valid sessions for monitoring")
@@ -642,14 +573,14 @@ class DiscordService:
         self.running = True
         
         try:
-            await self._http_polling_loop()
+            await self._http_polling_loop_announcement_only()
         except Exception as e:
             self.logger.error("HTTP polling monitoring failed", error=str(e))
         finally:
             self.running = False
     
-    async def _http_polling_loop(self) -> None:
-        """HTTP polling loop with intelligent scheduling"""
+    async def _http_polling_loop_announcement_only(self) -> None:
+        """ИСПРАВЛЕНО: HTTP polling только для announcement каналов"""
         base_poll_interval = 60  # Poll every 60 seconds
         error_count = 0
         
@@ -657,19 +588,22 @@ class DiscordService:
             try:
                 poll_start = datetime.now()
                 
-                # Poll each accessible channel
+                # ИСПРАВЛЕНО: Poll только announcement каналы
                 tasks = []
                 for server_name, server_info in self.servers.items():
                     if server_info.status != ServerStatus.ACTIVE:
                         continue
                     
                     for channel_id, channel_info in server_info.accessible_channels.items():
-                        task = self._poll_channel_safely(server_name, channel_id)
+                        # ИСПРАВЛЕНО: Проверяем что это announcement канал
+                        if not self._is_announcement_channel(channel_info.channel_name):
+                            continue
+                        
+                        task = self._poll_announcement_channel_safely(server_name, channel_id)
                         tasks.append(task)
                 
                 if tasks:
-                    # Execute polls with concurrency limit
-                    semaphore = asyncio.Semaphore(3)  # Max 3 concurrent polls
+                    semaphore = asyncio.Semaphore(3)
                     
                     async def poll_with_semaphore(task):
                         async with semaphore:
@@ -680,17 +614,16 @@ class DiscordService:
                         return_exceptions=True
                     )
                     
-                    # Count successful polls
                     successful_polls = sum(1 for result in results if result and not isinstance(result, Exception))
                     
-                    self.logger.info("Polling cycle completed", 
+                    self.logger.info("Announcement polling cycle completed", 
                                    total_polls=len(tasks),
                                    successful_polls=successful_polls,
                                    duration_seconds=(datetime.now() - poll_start).total_seconds())
                     
-                    error_count = 0  # Reset error count on successful cycle
+                    error_count = 0
                 else:
-                    self.logger.debug("No accessible channels to poll")
+                    self.logger.debug("No accessible announcement channels to poll")
                 
                 # Adaptive polling interval
                 poll_interval = base_poll_interval
@@ -701,21 +634,21 @@ class DiscordService:
                 
             except Exception as e:
                 error_count += 1
-                self.logger.error("Error in polling loop", 
+                self.logger.error("Error in announcement polling loop", 
                                 error=str(e),
                                 error_count=error_count)
                 
-                # Exponential backoff on repeated errors
                 error_delay = min(300, 30 * (2 ** min(error_count, 4)))
                 await asyncio.sleep(error_delay)
     
-    async def _poll_channel_safely(self, server_name: str, channel_id: str) -> bool:
-        """Poll a single channel safely and trigger callbacks for new messages"""
+    async def _poll_announcement_channel_safely(self, server_name: str, channel_id: str) -> bool:
+        """ИСПРАВЛЕНО: Poll только announcement канал"""
         try:
+            # ИСПРАВЛЕНО: Получаем только 3 последних сообщения для real-time
             messages = await self.get_recent_messages(server_name, channel_id, limit=3)
             
             if messages:
-                self.logger.debug("Found new messages during poll", 
+                self.logger.debug("Found new announcement messages during poll", 
                                 server=server_name,
                                 channel_id=channel_id,
                                 message_count=len(messages))
@@ -727,26 +660,34 @@ class DiscordService:
             return True
             
         except Exception as e:
-            self.logger.error("Error polling channel", 
+            self.logger.error("Error polling announcement channel", 
                             server=server_name,
                             channel_id=channel_id,
                             error=str(e))
             return False
     
     def get_server_stats(self) -> Dict[str, any]:
-        """Get statistics for all servers"""
+        """Get statistics for servers with announcement channels"""
+        announcement_channels_count = len(self.monitored_announcement_channels)
+        
         return {
             "total_servers": len(self.servers),
             "active_servers": len([s for s in self.servers.values() if s.status == ServerStatus.ACTIVE]),
             "total_channels": sum(s.channel_count for s in self.servers.values()),
             "accessible_channels": sum(s.accessible_channel_count for s in self.servers.values()),
+            "announcement_channels": announcement_channels_count,
+            "announcement_only": True,  # НОВОЕ: показывает что мониторим только announcement
             "valid_sessions": len(self.sessions),
-            "monitored_channels": len(self.monitored_channels),
+            "monitored_channels": len(self.monitored_announcement_channels),
             "message_callbacks": len(self.message_callbacks),
             "servers": {name: {
                 "status": server.status.value,
                 "channels": server.channel_count,
                 "accessible_channels": server.accessible_channel_count,
+                "announcement_channels": len([
+                    ch for ch in server.channels.values() 
+                    if self._is_announcement_channel(ch.channel_name)
+                ]),
                 "last_sync": server.last_sync.isoformat() if server.last_sync else None
             } for name, server in self.servers.items()}
         }
@@ -765,4 +706,4 @@ class DiscordService:
             if not session.closed:
                 await session.close()
         
-        self.logger.info("Discord service cleaned up")
+        self.logger.info("Discord service cleaned up (announcement channels only)")

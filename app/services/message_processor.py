@@ -337,7 +337,7 @@ class MessageProcessor:
                     messages = await self.discord_service.get_recent_messages(
                         server_name,
                         channel_id,
-                        limit=min(5, self.settings.max_history_messages // max(1, len(server_info.accessible_channels)))
+                        limit=5
                     )
                     
                     # Filter out duplicates using enhanced hash
