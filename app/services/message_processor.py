@@ -360,7 +360,7 @@ class MessageProcessor:
             
             if server_messages:
                 # Sort by timestamp and send to Telegram
-                server_messages.sort(key=lambda x: x.timestamp)
+                server_messages.sort(key=lambda x: x.timestamp, reverse=False)
                 sent_count = await self.telegram_service.send_messages_batch(server_messages)
                 
                 total_messages += sent_count
@@ -370,6 +370,7 @@ class MessageProcessor:
                 self.logger.info("Initial sync for server complete",
                                server=server_name,
                                messages_sent=sent_count,
+                               oldest_first=True,
                                announcement_channels=len([
                                    ch for ch in server_info.accessible_channels.values()
                                    if self._is_announcement_channel(ch.channel_name)
@@ -610,13 +611,15 @@ class MessageProcessor:
         
         if fallback_messages:
             # Sort and send
-            fallback_messages.sort(key=lambda x: x.timestamp)
+            fallback_messages.sort(key=lambda x: x.timestamp, reverse=False)
             sent_count = await self.telegram_service.send_messages_batch(fallback_messages)
             
             self.logger.info("Fallback sync completed (announcement channels)",
-                           server=server_name,
-                           messages_sent=sent_count,
-                           total_messages=len(fallback_messages))
+                       server=server_name,
+                       messages_sent=sent_count,
+                       total_messages=len(fallback_messages),
+                       oldest_first=True)
+            
             
             # Update sync time
             self.last_sync_times[server_name] = datetime.now()

@@ -514,7 +514,8 @@ class DiscordService:
                     # Update channel stats
                     channel.message_count += len(messages)
                     if messages:
-                        channel.last_message_time = messages[0].timestamp
+                        latest_message = max(messages, key=lambda x: x.timestamp)
+                        channel.last_message_time = latest_message.timestamp
                     
                     self.logger.info("Retrieved announcement messages", 
                                    server=server_name,
@@ -650,6 +651,7 @@ class DiscordService:
             if messages:
                 self.logger.debug("Found new announcement messages during poll", 
                                 server=server_name,
+                                oldest_first=True,
                                 channel_id=channel_id,
                                 message_count=len(messages))
                 

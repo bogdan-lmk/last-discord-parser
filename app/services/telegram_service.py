@@ -1278,7 +1278,7 @@ class TelegramService:
                            message_count=len(server_messages))
             
             # Sort messages chronologically
-            server_messages.sort(key=lambda x: x.timestamp)
+            server_messages.sort(key=lambda x: x.timestamp, reverse=False)
             
             # Get topic ONCE for all messages from this server
             topic_id = await self.get_or_create_server_topic(server_name)
@@ -1296,10 +1296,10 @@ class TelegramService:
                 await asyncio.sleep(0.1)
         
         self.logger.info("Enhanced batch sending complete", 
-                       total_messages=len(messages),
-                       sent_messages=sent_count,
-                       servers_processed=len(server_groups))
-        
+                   total_messages=len(messages),
+                   sent_messages=sent_count,
+                   servers_processed=len(server_groups),
+                   message_order="oldest_first_newest_last")
         return sent_count
     
     async def _send_message_to_topic(self, message: DiscordMessage, topic_id: Optional[int]) -> bool:
