@@ -13,7 +13,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class DiscordService:
-    """Исправленный Discord service - только announcement каналы и 5 последних сообщений"""
+    """Исправленный Discord service -  auto announcement + manually added каналы"""
     
     def __init__(self, 
                  settings: Settings,
@@ -406,41 +406,42 @@ class DiscordService:
         return False
     
     async def get_recent_messages(self, 
-                                 server_name: str, 
-                                 channel_id: str, 
-                                 limit: int = 5) -> List[DiscordMessage]:  # ИСПРАВЛЕНО: по умолчанию 5
-        """ИСПРАВЛЕНО: Получить только 5 последних сообщений из announcement каналов"""
+                             server_name: str, 
+                             channel_id: str, 
+                             limit: int = 5) -> List[DiscordMessage]:
+        """ИСПРАВЛЕНО: Получить сообщения из ЛЮБОГО добавленного канала"""
         if server_name not in self.servers:
             self.logger.warning("Server not found", server=server_name)
             return []
-        
+
         server = self.servers[server_name]
         if channel_id not in server.channels:
             self.logger.warning("Channel not found", 
-                              server=server_name, 
-                              channel_id=channel_id)
+                            server=server_name, 
+                            channel_id=channel_id)
             return []
-        
+
         channel = server.channels[channel_id]
         
-        # ИСПРАВЛЕНО: Проверяем что это announcement канал
-        if not self._is_announcement_channel(channel.channel_name):
-            self.logger.warning("Channel is not an announcement channel", 
-                              server=server_name, 
-                              channel=channel.channel_name)
+        # ИСПРАВЛЕНО: Убираем проверку на announcement - мониторим ЛЮБЫЕ добавленные каналы
+        # Проверяем только что канал в списке мониторимых
+        if channel_id not in self.monitored_announcement_channels:
+            self.logger.warning("Channel is not in monitored channels", 
+                            server=server_name, 
+                            channel=channel.channel_name)
             return []
-        
+
         if not channel.http_accessible:
-            self.logger.warning("Announcement channel not accessible via HTTP", 
-                              server=server_name, 
-                              channel=channel.channel_name)
+            self.logger.warning("Channel not accessible via HTTP", 
+                            server=server_name, 
+                            channel=channel.channel_name)
             return []
-        
+
         session = self._get_healthy_session()
         if not session:
             self.logger.error("No healthy sessions available")
             return []
-        
+
         messages = []
         
         # ИСПРАВЛЕНО: Ограничиваем до 5 сообщений максимум
@@ -458,9 +459,9 @@ class DiscordService:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
                         self.logger.warning("Rate limited fetching messages", 
-                                          channel_id=channel_id,
-                                          retry_after=retry_after,
-                                          attempt=attempt + 1)
+                                        channel_id=channel_id,
+                                        retry_after=retry_after,
+                                        attempt=attempt + 1)
                         
                         await asyncio.sleep(min(retry_after, 60))
                         continue
@@ -507,8 +508,8 @@ class DiscordService:
                             
                         except Exception as e:
                             self.logger.warning("Failed to parse message", 
-                                              message_id=raw_msg.get('id'),
-                                              error=str(e))
+                                            message_id=raw_msg.get('id'),
+                                            error=str(e))
                             continue
                     
                     # Update channel stats
@@ -517,11 +518,13 @@ class DiscordService:
                         latest_message = max(messages, key=lambda x: x.timestamp)
                         channel.last_message_time = latest_message.timestamp
                     
-                    self.logger.info("Retrieved announcement messages", 
-                                   server=server_name,
-                                   channel=channel.channel_name,
-                                   message_count=len(messages),
-                                   limit_used=actual_limit)
+                    channel_type = "announcement" if self._is_announcement_channel(channel.channel_name) else "regular"
+                    self.logger.info("Retrieved messages from monitored channel", 
+                                server=server_name,
+                                channel=channel.channel_name,
+                                channel_type=channel_type,
+                                message_count=len(messages),
+                                limit_used=actual_limit)
                     
                     return sorted(messages, key=lambda x: x.timestamp)
                     
@@ -563,25 +566,8 @@ class DiscordService:
         self.token_failure_counts = {i: 0 for i in range(len(self.sessions))}
         return self.sessions[0]
     
-    async def start_websocket_monitoring(self) -> None:
-        """ИСПРАВЛЕНО: HTTP polling только для announcement каналов"""
-        self.logger.info("Starting HTTP polling for ANNOUNCEMENT channels only")
-        
-        if not self.sessions:
-            self.logger.error("No valid sessions for monitoring")
-            return
-        
-        self.running = True
-        
-        try:
-            await self._http_polling_loop_announcement_only()
-        except Exception as e:
-            self.logger.error("HTTP polling monitoring failed", error=str(e))
-        finally:
-            self.running = False
-    
     async def _http_polling_loop_announcement_only(self) -> None:
-        """ИСПРАВЛЕНО: HTTP polling только для announcement каналов"""
+        """ИСПРАВЛЕНО: HTTP polling для всех monitored каналов"""
         base_poll_interval = 60  # Poll every 60 seconds
         error_count = 0
         
@@ -589,18 +575,30 @@ class DiscordService:
             try:
                 poll_start = datetime.now()
                 
-                # ИСПРАВЛЕНО: Poll только announcement каналы
+                # ИСПРАВЛЕНО: Poll все каналы из monitored_announcement_channels
                 tasks = []
-                for server_name, server_info in self.servers.items():
-                    if server_info.status != ServerStatus.ACTIVE:
-                        continue
-                    
-                    for channel_id, channel_info in server_info.accessible_channels.items():
-                        # ИСПРАВЛЕНО: Проверяем что это announcement канал
-                        if not self._is_announcement_channel(channel_info.channel_name):
+                
+                # Группируем каналы по серверам для эффективности
+                server_channel_map = {}
+                for channel_id in self.monitored_announcement_channels:
+                    # Найти сервер для этого канала
+                    server_name = None
+                    for srv_name, srv_info in self.servers.items():
+                        if srv_info.status != ServerStatus.ACTIVE:
                             continue
-                        
-                        task = self._poll_announcement_channel_safely(server_name, channel_id)
+                        if channel_id in srv_info.channels:
+                            server_name = srv_name
+                            break
+                    
+                    if server_name:
+                        if server_name not in server_channel_map:
+                            server_channel_map[server_name] = []
+                        server_channel_map[server_name].append(channel_id)
+                
+                # Создаем задачи для polling каналов
+                for server_name, channel_ids in server_channel_map.items():
+                    for channel_id in channel_ids:
+                        task = self._poll_monitored_channel_safely(server_name, channel_id)
                         tasks.append(task)
                 
                 if tasks:
@@ -617,14 +615,28 @@ class DiscordService:
                     
                     successful_polls = sum(1 for result in results if result and not isinstance(result, Exception))
                     
-                    self.logger.info("Announcement polling cycle completed", 
-                                   total_polls=len(tasks),
-                                   successful_polls=successful_polls,
-                                   duration_seconds=(datetime.now() - poll_start).total_seconds())
+                    # Подсчет типов каналов для статистики
+                    announcement_polls = 0
+                    regular_polls = 0
+                    for server_name, channel_ids in server_channel_map.items():
+                        for channel_id in channel_ids:
+                            if server_name in self.servers and channel_id in self.servers[server_name].channels:
+                                channel_info = self.servers[server_name].channels[channel_id]
+                                if self._is_announcement_channel(channel_info.channel_name):
+                                    announcement_polls += 1
+                                else:
+                                    regular_polls += 1
+                    
+                    self.logger.info("Monitored channels polling cycle completed", 
+                                total_polls=len(tasks),
+                                successful_polls=successful_polls,
+                                announcement_channels=announcement_polls,
+                                regular_channels=regular_polls,
+                                duration_seconds=(datetime.now() - poll_start).total_seconds())
                     
                     error_count = 0
                 else:
-                    self.logger.debug("No accessible announcement channels to poll")
+                    self.logger.debug("No monitored channels to poll")
                 
                 # Adaptive polling interval
                 poll_interval = base_poll_interval
@@ -635,23 +647,27 @@ class DiscordService:
                 
             except Exception as e:
                 error_count += 1
-                self.logger.error("Error in announcement polling loop", 
+                self.logger.error("Error in monitored channels polling loop", 
                                 error=str(e),
                                 error_count=error_count)
                 
                 error_delay = min(300, 30 * (2 ** min(error_count, 4)))
                 await asyncio.sleep(error_delay)
     
-    async def _poll_announcement_channel_safely(self, server_name: str, channel_id: str) -> bool:
-        """ИСПРАВЛЕНО: Poll только announcement канал"""
+    async def _poll_monitored_channel_safely(self, server_name: str, channel_id: str) -> bool:
+        """ИСПРАВЛЕНО: Poll любой monitored канал"""
         try:
             # ИСПРАВЛЕНО: Получаем только 3 последних сообщения для real-time
             messages = await self.get_recent_messages(server_name, channel_id, limit=3)
             
             if messages:
-                self.logger.debug("Found new announcement messages during poll", 
+                channel_info = self.servers[server_name].channels[channel_id]
+                channel_type = "announcement" if self._is_announcement_channel(channel_info.channel_name) else "regular"
+                
+                self.logger.debug("Found new messages during poll", 
                                 server=server_name,
-                                oldest_first=True,
+                                channel_name=channel_info.channel_name,
+                                channel_type=channel_type,
                                 channel_id=channel_id,
                                 message_count=len(messages))
                 
@@ -662,33 +678,115 @@ class DiscordService:
             return True
             
         except Exception as e:
-            self.logger.error("Error polling announcement channel", 
+            self.logger.error("Error polling monitored channel", 
                             server=server_name,
                             channel_id=channel_id,
                             error=str(e))
             return False
-    
+
+    async def start_websocket_monitoring(self) -> None:
+        """ИСПРАВЛЕНО: HTTP polling для всех monitored каналов"""
+        self.logger.info("Starting HTTP polling for monitored channels", 
+                    monitored_channels=len(self.monitored_announcement_channels),
+                    channel_types="announcement + manually added")
+        
+        if not self.sessions:
+            self.logger.error("No valid sessions for monitoring")
+            return
+        
+        self.running = True
+        
+        try:
+            await self._http_polling_loop_announcement_only()
+        except Exception as e:
+            self.logger.error("HTTP polling monitoring failed", error=str(e))
+        finally:
+            self.running = False
+            
+    def notify_new_channel_added(self, server_name: str, channel_id: str, channel_name: str) -> bool:
+        """ИСПРАВЛЕНО: Уведомление о добавлении канала - ЛЮБОЙ добавленный канал мониторится"""
+        try:
+            if server_name not in self.servers:
+                self.logger.error(f"Server {server_name} not found")
+                return False
+            
+            server_info = self.servers[server_name]
+            
+            if channel_id not in server_info.channels:
+                self.logger.warning(f"Channel {channel_id} not found in server {server_name} channels")
+                return False
+            
+            # ИСПРАВЛЕНО: Добавляем в monitored channels ЛЮБОЙ вручную добавленный канал
+            self.monitored_announcement_channels.add(channel_id)
+            
+            is_announcement = self._is_announcement_channel(channel_name)
+            if is_announcement:
+                self.logger.info(f"✅ Added ANNOUNCEMENT channel '{channel_name}' ({channel_id}) to monitoring")
+            else:
+                self.logger.info(f"✅ Added regular channel '{channel_name}' ({channel_id}) to monitoring")
+            
+            self.logger.info(f"📢 Channel '{channel_name}' WILL forward messages to Telegram")
+            self.logger.info(f"🔔 Manual addition = automatic monitoring")
+            
+            # Обновляем статистику
+            server_info.update_stats()
+            
+            self.logger.info(f"📊 Server '{server_name}' statistics:")
+            self.logger.info(f"   • Total channels: {len(server_info.channels)}")
+            self.logger.info(f"   • Accessible channels: {len(server_info.accessible_channels)}")
+            self.logger.info(f"   • Monitored channels: {len([
+                ch_id for ch_id in server_info.channels.keys() 
+                if ch_id in self.monitored_announcement_channels
+            ])}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error in notify_new_channel_added: {e}")
+            return False
     def get_server_stats(self) -> Dict[str, any]:
-        """Get statistics for servers with announcement channels"""
-        announcement_channels_count = len(self.monitored_announcement_channels)
+        """ИСПРАВЛЕНО: Get statistics for servers with monitored channels"""
+        monitored_channels_count = len(self.monitored_announcement_channels)
+        
+        # Подсчитываем announcement каналы отдельно 
+        auto_discovered_announcement = 0
+        manually_added_channels = 0
+        
+        for server_info in self.servers.values():
+            for channel_id, channel_info in server_info.channels.items():
+                if channel_id in self.monitored_announcement_channels:
+                    if self._is_announcement_channel(channel_info.channel_name):
+                        auto_discovered_announcement += 1
+                    else:
+                        manually_added_channels += 1
         
         return {
             "total_servers": len(self.servers),
             "active_servers": len([s for s in self.servers.values() if s.status == ServerStatus.ACTIVE]),
             "total_channels": sum(s.channel_count for s in self.servers.values()),
             "accessible_channels": sum(s.accessible_channel_count for s in self.servers.values()),
-            "announcement_channels": announcement_channels_count,
-            "announcement_only": True,  # НОВОЕ: показывает что мониторим только announcement
+            "monitored_channels": monitored_channels_count,
+            "auto_discovered_announcement": auto_discovered_announcement,
+            "manually_added_channels": manually_added_channels,
+            "monitoring_strategy": "auto announcement + manual any",  # НОВОЕ: описание стратегии
             "valid_sessions": len(self.sessions),
-            "monitored_channels": len(self.monitored_announcement_channels),
             "message_callbacks": len(self.message_callbacks),
             "servers": {name: {
                 "status": server.status.value,
                 "channels": server.channel_count,
                 "accessible_channels": server.accessible_channel_count,
+                "monitored_channels": len([
+                    ch_id for ch_id in server.channels.keys() 
+                    if ch_id in self.monitored_announcement_channels
+                ]),
                 "announcement_channels": len([
                     ch for ch in server.channels.values() 
                     if self._is_announcement_channel(ch.channel_name)
+                ]),
+                "manually_added_channels": len([
+                    ch_id for ch_id, ch_info in server.channels.items() 
+                    if ch_id in self.monitored_announcement_channels and 
+                    not self._is_announcement_channel(ch_info.channel_name)
                 ]),
                 "last_sync": server.last_sync.isoformat() if server.last_sync else None
             } for name, server in self.servers.items()}

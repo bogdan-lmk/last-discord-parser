@@ -286,7 +286,7 @@ async def sync_server(
     discord_service: DiscordService = Depends(get_discord_service_dependency),
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Manually sync a specific server (all messages go to one topic)"""
+    """ИСПРАВЛЕНО: Manually sync a specific server (only monitored channels)"""
     if server_name not in discord_service.servers:
         raise HTTPException(status_code=404, detail="Server not found")
     
@@ -295,56 +295,92 @@ async def sync_server(
         logger = structlog.get_logger(__name__)
         try:
             server_info = discord_service.servers[server_name]
-            all_messages = []
+            monitored_messages = []
             
-            # Get recent messages from all accessible channels
+            # ИСПРАВЛЕНИЕ: Get messages only from monitored channels
+            monitored_channels = []
             for channel_id, channel_info in server_info.accessible_channels.items():
-                messages = await discord_service.get_recent_messages(
-                    server_name, channel_id, limit=5
-                )
-                all_messages.extend(messages)
+                if channel_id in discord_service.monitored_announcement_channels:
+                    monitored_channels.append((channel_id, channel_info))
+                    
+                    messages = await discord_service.get_recent_messages(
+                        server_name, channel_id, limit=5
+                    )
+                    monitored_messages.extend(messages)
             
-            if all_messages:
+            if monitored_messages:
                 # Sort by timestamp and send to Telegram (all to same topic)
-                all_messages.sort(key=lambda x: x.timestamp)
-                sent_count = await telegram_service.send_messages_batch(all_messages)
+                monitored_messages.sort(key=lambda x: x.timestamp)
+                sent_count = await telegram_service.send_messages_batch(monitored_messages)
                 
                 # Get topic info
                 topic_id = telegram_service.server_topics.get(server_name)
                 
+                # Count channel types
+                announcement_channels = sum(1 for _, ch_info in monitored_channels 
+                                          if discord_service._is_announcement_channel(ch_info.channel_name))
+                manual_channels = len(monitored_channels) - announcement_channels
+                
                 logger.info("Manual sync completed", 
                           server=server_name,
                           messages_sent=sent_count,
-                          total_messages=len(all_messages),
+                          total_messages=len(monitored_messages),
                           topic_id=topic_id,
-                          channels_synced=len(server_info.accessible_channels))
+                          monitored_channels=len(monitored_channels),
+                          announcement_channels=announcement_channels,
+                          manual_channels=manual_channels)
             else:
-                logger.info("No messages found during manual sync", server=server_name)
+                logger.info("No monitored channels found during manual sync", 
+                          server=server_name,
+                          total_channels=len(server_info.accessible_channels))
                 
         except Exception as e:
             logger.error("Manual sync failed", server=server_name, error=str(e))
     
     background_tasks.add_task(sync_task)
     
+    # Count monitored channels for response
+    server_info = discord_service.servers[server_name]
+    monitored_count = len([ch_id for ch_id in server_info.accessible_channels.keys() 
+                          if ch_id in discord_service.monitored_announcement_channels])
+    
     return {
         "message": f"Enhanced sync started for {server_name}",
-        "note": "All channels from this server will post to the same Telegram topic",
+        "note": "Only monitored channels will be synced to the same Telegram topic",
+        "monitored_channels": monitored_count,
+        "total_channels": len(server_info.accessible_channels),
         "current_topic_id": telegram_service.server_topics.get(server_name),
         "anti_duplicate_protection": getattr(telegram_service, 'startup_verification_done', True)
     }
+
 
 @app.post("/messages/recent")
 async def get_recent_messages(
     request: MessageRequest,
     discord_service: DiscordService = Depends(get_discord_service_dependency)
 ):
-    """Get recent messages from a specific channel"""
+    """ИСПРАВЛЕНО: Get recent messages from a monitored channel only"""
     try:
+        # ИСПРАВЛЕНИЕ: Проверяем что канал мониторится
+        if request.channel_id not in discord_service.monitored_announcement_channels:
+            raise HTTPException(
+                status_code=400, 
+                detail="Channel is not monitored. Only monitored channels can be queried."
+            )
+        
         messages = await discord_service.get_recent_messages(
             request.server_name,
             request.channel_id,
             limit=request.limit
         )
+        
+        # Определяем тип канала
+        channel_type = "unknown"
+        if request.server_name in discord_service.servers:
+            server_info = discord_service.servers[request.server_name]
+            if request.channel_id in server_info.channels:
+                channel_info = server_info.channels[request.channel_id]
+                channel_type = "announcement" if discord_service._is_announcement_channel(channel_info.channel_name) else "regular"
         
         return {
             "messages": [
@@ -361,12 +397,17 @@ async def get_recent_messages(
             "count": len(messages),
             "server": request.server_name,
             "channel_id": request.channel_id,
-            "note": f"Messages from this channel post to server topic",
+            "channel_type": channel_type,
+            "note": f"Messages from this {channel_type} channel post to server topic",
+            "monitoring_status": "✅ Monitored",
             "enhanced_features": True
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/telegram/topics/clean")
 async def clean_telegram_topics(
@@ -581,7 +622,7 @@ async def list_servers(
     discord_service: DiscordService = Depends(get_discord_service_dependency),
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """List all configured Discord servers with enhanced topic information"""
+    """ИСПРАВЛЕНО: List servers with enhanced monitoring info"""
     servers_data = []
     
     for server_name, server_info in discord_service.servers.items():
@@ -597,19 +638,36 @@ async def list_servers(
             except Exception:
                 topic_verified = False
         
+        # НОВОЕ: Подсчет типов каналов
+        monitored_channels = 0
+        announcement_channels = 0
+        manual_channels = 0
+        
+        for channel_id, channel_info in server_info.channels.items():
+            if channel_id in discord_service.monitored_announcement_channels:
+                monitored_channels += 1
+                if discord_service._is_announcement_channel(channel_info.channel_name):
+                    announcement_channels += 1
+                else:
+                    manual_channels += 1
+        
         servers_data.append({
             "name": server_name,
             "guild_id": server_info.guild_id,
             "status": server_info.status.value,
             "channels": server_info.channel_count,
             "accessible_channels": server_info.accessible_channel_count,
+            "monitored_channels": monitored_channels,  # НОВОЕ
+            "announcement_channels": announcement_channels,  # НОВОЕ
+            "manually_added_channels": manual_channels,  # НОВОЕ
             "last_sync": server_info.last_sync.isoformat() if server_info.last_sync else None,
             "telegram_topic_id": topic_id,
-            "topic_verified": topic_verified,  # НОВОЕ
-            "enhanced_features": {  # НОВОЕ
+            "topic_verified": topic_verified,
+            "enhanced_features": {
                 "has_topic": topic_id is not None,
                 "topic_protection": telegram_service.startup_verification_done,
-                "channel_management": True
+                "channel_management": True,
+                "monitoring_strategy": "auto announcement + manual any"  # НОВОЕ
             }
         })
     
@@ -628,24 +686,47 @@ async def get_server(
     discord_service: DiscordService = Depends(get_discord_service_dependency),
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """Get detailed information about a specific server with enhanced features"""
+    """ИСПРАВЛЕНО: Get detailed server info with monitoring status"""
     if server_name not in discord_service.servers:
         raise HTTPException(status_code=404, detail="Server not found")
     
     server_info = discord_service.servers[server_name]
     
     channels_data = []
+    announcement_channels = 0
+    manual_channels = 0
+    monitored_channels = 0
+    
     for channel_id, channel_info in server_info.channels.items():
+        is_monitored = channel_id in discord_service.monitored_announcement_channels
+        is_announcement = discord_service._is_announcement_channel(channel_info.channel_name)
+        
+        # Определяем тип канала
+        channel_type = "announcement" if is_announcement else "regular"
+        monitoring_reason = ""
+        
+        if is_monitored:
+            monitored_channels += 1
+            if is_announcement:
+                announcement_channels += 1
+                monitoring_reason = "Auto-discovered announcement channel"
+            else:
+                manual_channels += 1
+                monitoring_reason = "Manually added channel"
+        
         channels_data.append({
             "channel_id": channel_id,
             "channel_name": channel_info.channel_name,
+            "channel_type": channel_type,  # НОВОЕ
+            "is_monitored": is_monitored,  # НОВОЕ
+            "monitoring_reason": monitoring_reason,  # НОВОЕ
             "http_accessible": channel_info.http_accessible,
             "websocket_accessible": channel_info.websocket_accessible,
             "access_method": channel_info.access_method,
             "message_count": channel_info.message_count,
             "last_message_time": channel_info.last_message_time.isoformat() if channel_info.last_message_time else None,
             "last_checked": channel_info.last_checked.isoformat() if channel_info.last_checked else None,
-            "manageable": True  # НОВОЕ: показывает что канал можно управлять через API
+            "manageable": True
         })
     
     # Enhanced topic information
@@ -680,18 +761,27 @@ async def get_server(
         "telegram_topic_id": telegram_topic_id,
         "total_messages": server_info.total_messages,
         "last_activity": server_info.last_activity.isoformat() if server_info.last_activity else None,
-        "enhanced_topic_info": {  # НОВОЕ
+        "monitoring_summary": {  # НОВОЕ
+            "total_channels": len(channels_data),
+            "monitored_channels": monitored_channels,
+            "announcement_channels": announcement_channels,
+            "manually_added_channels": manual_channels,
+            "non_monitored_channels": len(channels_data) - monitored_channels,
+            "monitoring_strategy": "auto announcement + manual any"
+        },
+        "enhanced_topic_info": {
             "has_topic": telegram_topic_id is not None,
             "topic_id": telegram_topic_id,
             "topic_verified": topic_verified,
             "can_create_topic": topic_can_create,
             "protection_active": telegram_service.startup_verification_done,
-            "note": "All channels from this server post to the same Telegram topic"
+            "note": "All monitored channels from this server post to the same Telegram topic"  # ИСПРАВЛЕНО
         },
-        "channel_management": {  # НОВОЕ
+        "channel_management": {
             "can_add_channels": True,
             "max_channels": server_info.max_channels,
-            "available_slots": server_info.max_channels - server_info.channel_count
+            "available_slots": server_info.max_channels - server_info.channel_count,
+            "note": "Any added channel will be automatically monitored"  # НОВОЕ
         }
     }
 
@@ -707,6 +797,112 @@ async def get_telegram_topics(
         anti_duplicate_protection=getattr(telegram_service, 'startup_verification_done', True)
     )
 
+@app.get("/monitoring/status")
+async def get_monitoring_status(
+    discord_service: DiscordService = Depends(get_discord_service_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """Get comprehensive monitoring status"""
+    try:
+        # Подсчет всех типов каналов
+        total_channels = 0
+        accessible_channels = 0
+        monitored_channels = 0
+        announcement_channels = 0
+        manual_channels = 0
+        
+        server_breakdown = {}
+        
+        for server_name, server_info in discord_service.servers.items():
+            server_stats = {
+                "total": len(server_info.channels),
+                "accessible": len(server_info.accessible_channels),
+                "monitored": 0,
+                "announcement": 0,
+                "manual": 0
+            }
+            
+            total_channels += len(server_info.channels)
+            accessible_channels += len(server_info.accessible_channels)
+            
+            for channel_id, channel_info in server_info.channels.items():
+                if channel_id in discord_service.monitored_announcement_channels:
+                    monitored_channels += 1
+                    server_stats["monitored"] += 1
+                    
+                    if discord_service._is_announcement_channel(channel_info.channel_name):
+                        announcement_channels += 1
+                        server_stats["announcement"] += 1
+                    else:
+                        manual_channels += 1
+                        server_stats["manual"] += 1
+            
+            server_breakdown[server_name] = server_stats
+        
+        return {
+            "monitoring_strategy": "auto announcement + manual any",
+            "global_stats": {
+                "total_channels": total_channels,
+                "accessible_channels": accessible_channels,
+                "monitored_channels": monitored_channels,
+                "auto_discovered_announcement": announcement_channels,
+                "manually_added_channels": manual_channels,
+                "non_monitored_channels": accessible_channels - monitored_channels
+            },
+            "telegram_integration": {
+                "total_topics": len(telegram_service.server_topics),
+                "verified_topics": sum(1 for topic_id in telegram_service.server_topics.values() 
+                                     if telegram_service._topic_exists(telegram_service.settings.telegram_chat_id, topic_id)),
+                "anti_duplicate_protection": telegram_service.startup_verification_done,
+                "bot_running": telegram_service.bot_running
+            },
+            "servers": server_breakdown,
+            "features": {
+                "auto_discovery": "Announcement channels found automatically",
+                "manual_addition": "Any channel can be added via Telegram bot",
+                "universal_monitoring": "All added channels are monitored",
+                "single_topic_per_server": "All server channels post to same topic"
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# НОВЫЙ: Эндпоинт для получения только мониторимых каналов
+@app.get("/servers/{server_name}/monitored-channels")
+async def get_monitored_channels(
+    server_name: str,
+    discord_service: DiscordService = Depends(get_discord_service_dependency)
+):
+    """Get only monitored channels for a server"""
+    if server_name not in discord_service.servers:
+        raise HTTPException(status_code=404, detail="Server not found")
+    
+    server_info = discord_service.servers[server_name]
+    monitored_channels = []
+    
+    for channel_id, channel_info in server_info.channels.items():
+        if channel_id in discord_service.monitored_announcement_channels:
+            is_announcement = discord_service._is_announcement_channel(channel_info.channel_name)
+            
+            monitored_channels.append({
+                "channel_id": channel_id,
+                "channel_name": channel_info.channel_name,
+                "channel_type": "announcement" if is_announcement else "regular",
+                "monitoring_reason": "Auto-discovered" if is_announcement else "Manually added",
+                "http_accessible": channel_info.http_accessible,
+                "message_count": channel_info.message_count,
+                "last_message_time": channel_info.last_message_time.isoformat() if channel_info.last_message_time else None
+            })
+    
+    return {
+        "server_name": server_name,
+        "monitored_channels": monitored_channels,
+        "total_monitored": len(monitored_channels),
+        "announcement_channels": len([ch for ch in monitored_channels if ch["channel_type"] == "announcement"]),
+        "manually_added_channels": len([ch for ch in monitored_channels if ch["channel_type"] == "regular"]),
+        "note": "All these channels forward messages to the same Telegram topic"
+    }
 
 # Остальные эндпоинты остаются без изменений...
 # (все остальные методы из исходного файла сохраняются)

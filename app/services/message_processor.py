@@ -1,4 +1,4 @@
-# app/services/message_processor.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# app/services/message_processor.py - ПОЛНАЯ ИСПРАВЛЕННАЯ ВЕРСИЯ
 import asyncio
 import hashlib
 import threading
@@ -13,7 +13,7 @@ from .discord_service import DiscordService
 from .telegram_service import TelegramService
 
 class MessageProcessor:
-    """ИСПРАВЛЕННЫЙ главный оркестратор с правильной синхронизацией"""
+    """ИСПРАВЛЕННЫЙ главный оркестратор - auto announcement + manually added каналы"""
     
     def __init__(self,
                  settings: Settings,
@@ -82,7 +82,6 @@ class MessageProcessor:
         # ИСПРАВЛЕНИЕ: Правильная регистрация колбэка
         self.discord_service.add_message_callback(self._handle_realtime_message)
         
-        
         # Initialize sync intervals for each server
         for server_name in self.discord_service.servers.keys():
             self.sync_intervals[server_name] = 300  # 5 minutes default
@@ -97,9 +96,8 @@ class MessageProcessor:
                         discord_servers=len(self.discord_service.servers),
                         telegram_topics=len(self.telegram_service.server_topics),
                         realtime_enabled=self.realtime_enabled,
-                        monitored_announcement_channels=sum(
-                            s.accessible_channel_count for s in self.discord_service.servers.values()
-                        ))
+                        monitored_channels=len(self.discord_service.monitored_announcement_channels),
+                        monitoring_strategy="auto announcement + manual any")
         
         return True
     
@@ -134,11 +132,12 @@ class MessageProcessor:
                                   is_realtime=True)
                 return
             
-            # ИСПРАВЛЕНИЕ: Проверяем что это announcement канал
-            if not self._is_announcement_channel(message.channel_name):
-                self.logger.debug("Message from non-announcement channel ignored",
+            # ИСПРАВЛЕНО: Проверяем что канал мониторится (любой добавленный канал)
+            if message.channel_id not in self.discord_service.monitored_announcement_channels:
+                self.logger.debug("Message from non-monitored channel ignored",
                                 server=message.server_name,
-                                channel=message.channel_name)
+                                channel=message.channel_name,
+                                channel_id=message.channel_id)
                 return
             
             # Add to processing queue
@@ -152,9 +151,11 @@ class MessageProcessor:
                 self._update_rate_tracking(message.server_name)
                 self.server_last_activity[message.server_name] = datetime.now()
                 
+                channel_type = "announcement" if self._is_announcement_channel(message.channel_name) else "regular"
                 self.logger.info("Real-time message queued", 
                                server=message.server_name,
                                channel=message.channel_name,
+                               channel_type=channel_type,
                                author=message.author,
                                queue_size=self.message_queue.qsize(),
                                message_hash=message_hash[:8])
@@ -262,7 +263,7 @@ class MessageProcessor:
             asyncio.create_task(self._deduplication_cleanup_loop())  # Новый таск
         ]
         
-        # Start Discord monitoring (HTTP polling for announcement channels)
+        # Start Discord monitoring (HTTP polling for monitored channels)
         discord_task = asyncio.create_task(self.discord_service.start_websocket_monitoring())
         self.tasks.append(discord_task)
         
@@ -270,7 +271,7 @@ class MessageProcessor:
         telegram_task = asyncio.create_task(self.telegram_service.start_bot_async())
         self.tasks.append(telegram_task)
         
-        # Perform initial sync (только announcement каналы)
+        # Perform initial sync (все monitored каналы)
         await self._perform_initial_sync()
         
         self.logger.info("ИСПРАВЛЕННЫЙ Message Processor started successfully")
@@ -313,8 +314,8 @@ class MessageProcessor:
         self.logger.info("ИСПРАВЛЕННЫЙ Message Processor stopped")
     
     async def _perform_initial_sync(self) -> None:
-        """ИСПРАВЛЕНО: Perform initial synchronization of recent messages"""
-        self.logger.info("Starting initial synchronization (announcement channels only)")
+        """ИСПРАВЛЕНО: Perform initial synchronization of monitored channels"""
+        self.logger.info("Starting initial synchronization (monitored channels: auto announcement + manually added)")
         
         total_messages = 0
         
@@ -324,11 +325,11 @@ class MessageProcessor:
             
             server_messages = []
             
-            # ИСПРАВЛЕНИЕ: Get messages only from announcement channels
+            # ИСПРАВЛЕНИЕ: Get messages from ALL monitored channels (not just announcement)
             for channel_id, channel_info in server_info.accessible_channels.items():
-                # Проверяем что это announcement канал
-                if not self._is_announcement_channel(channel_info.channel_name):
-                    self.logger.debug("Skipping non-announcement channel", 
+                # Проверяем что канал мониторится (любой добавленный)
+                if channel_id not in self.discord_service.monitored_announcement_channels:
+                    self.logger.debug("Skipping non-monitored channel", 
                                     server=server_name,
                                     channel=channel_info.channel_name)
                     continue
@@ -367,14 +368,20 @@ class MessageProcessor:
                 self.last_sync_times[server_name] = datetime.now()
                 self.server_message_counts[server_name] = sent_count
                 
+                # Count channel types for logging
+                announcement_count = sum(1 for ch in server_info.accessible_channels.values() 
+                                       if ch.channel_id in self.discord_service.monitored_announcement_channels 
+                                       and self._is_announcement_channel(ch.channel_name))
+                regular_count = sum(1 for ch in server_info.accessible_channels.values() 
+                                  if ch.channel_id in self.discord_service.monitored_announcement_channels 
+                                  and not self._is_announcement_channel(ch.channel_name))
+                
                 self.logger.info("Initial sync for server complete",
                                server=server_name,
                                messages_sent=sent_count,
                                oldest_first=True,
-                               announcement_channels=len([
-                                   ch for ch in server_info.accessible_channels.values()
-                                   if self._is_announcement_channel(ch.channel_name)
-                               ]))
+                               announcement_channels=announcement_count,
+                               manually_added_channels=regular_count)
         
         self.stats.messages_processed_total += total_messages
         
@@ -382,11 +389,11 @@ class MessageProcessor:
                         total_messages=total_messages,
                         servers_synced=len([s for s in self.discord_service.servers.values() 
                                           if s.status == ServerStatus.ACTIVE]),
-                        announcement_channels_only=True)
+                        monitoring_strategy="auto announcement + manual any")
     
     async def _realtime_message_processor_loop(self) -> None:
         """Real-time message processing loop"""
-        self.logger.info("Starting real-time message processor loop (announcement channels)")
+        self.logger.info("Starting real-time message processor loop (monitored channels)")
         
         while self.running:
             try:
@@ -407,11 +414,11 @@ class MessageProcessor:
                 await asyncio.sleep(1)
     
     async def _process_realtime_message(self, message: DiscordMessage) -> None:
-        """ИСПРАВЛЕНО: Process a real-time Discord message"""
+        """ИСПРАВЛЕНО: Process a real-time Discord message from any monitored channel"""
         try:
-            # Double-check это announcement канал
-            if not self._is_announcement_channel(message.channel_name):
-                self.logger.debug("Non-announcement message skipped in processing",
+            # ИСПРАВЛЕНО: Убираем проверку на announcement - проверяем только что канал мониторится
+            if message.channel_id not in self.discord_service.monitored_announcement_channels:
+                self.logger.debug("Non-monitored channel message skipped in processing",
                                 server=message.server_name,
                                 channel=message.channel_name)
                 return
@@ -428,9 +435,11 @@ class MessageProcessor:
                 if self.redis_client:
                     await self._cache_message_in_redis(message)
                 
-                self.logger.info("Real-time announcement message processed",
+                channel_type = "announcement" if self._is_announcement_channel(message.channel_name) else "regular"
+                self.logger.info("Real-time message processed",
                                server=message.server_name,
                                channel=message.channel_name,
+                               channel_type=channel_type,
                                total_today=self.stats.messages_processed_today,
                                server_total=self.server_message_counts[message.server_name])
             else:
@@ -500,7 +509,7 @@ class MessageProcessor:
                 await asyncio.sleep(300)
     
     async def _batch_processor_loop(self) -> None:
-        """Batch message processing loop (fallback for missed messages)"""
+        """Batch message processing loop for monitored channels"""
         while self.running:
             try:
                 await asyncio.sleep(10)  # Process batches every 10 seconds
@@ -509,26 +518,33 @@ class MessageProcessor:
                     messages_to_process = self.batch_queue.copy()
                     self.batch_queue.clear()
                     
-                    # ИСПРАВЛЕНИЕ: Filter only announcement channel messages
-                    announcement_messages = [
+                    # ИСПРАВЛЕНО: Filter by monitored channels (not just announcement)
+                    monitored_messages = [
                         msg for msg in messages_to_process
-                        if self._is_announcement_channel(msg.channel_name)
+                        if msg.channel_id in self.discord_service.monitored_announcement_channels
                     ]
                     
-                    if announcement_messages:
-                        sent_count = await self.telegram_service.send_messages_batch(announcement_messages)
+                    if monitored_messages:
+                        sent_count = await self.telegram_service.send_messages_batch(monitored_messages)
                         
                         self.stats.messages_processed_today += sent_count
                         self.stats.messages_processed_total += sent_count
                         
-                        if sent_count < len(announcement_messages):
-                            failed_count = len(announcement_messages) - sent_count
+                        if sent_count < len(monitored_messages):
+                            failed_count = len(monitored_messages) - sent_count
                             self.stats.errors_last_hour += failed_count
                         
-                        self.logger.info("Batch processed (announcement only)",
+                        # Count types for logging
+                        announcement_count = sum(1 for msg in monitored_messages 
+                                               if self._is_announcement_channel(msg.channel_name))
+                        regular_count = len(monitored_messages) - announcement_count
+                        
+                        self.logger.info("Batch processed (monitored channels)",
                                        processed=sent_count,
                                        total_submitted=len(messages_to_process),
-                                       announcement_only=len(announcement_messages))
+                                       monitored_messages=len(monitored_messages),
+                                       announcement_messages=announcement_count,
+                                       regular_messages=regular_count)
                 
             except Exception as e:
                 self.logger.error("Error in batch processor loop", error=str(e))
@@ -541,7 +557,7 @@ class MessageProcessor:
                 # Run sync every 5 minutes as fallback
                 await asyncio.sleep(300)
                 
-                self.logger.info("Starting periodic fallback sync (announcement channels)")
+                self.logger.info("Starting periodic fallback sync (monitored channels: auto announcement + manual any)")
                 
                 # Check each server for missed messages
                 for server_name, last_sync in self.last_sync_times.items():
@@ -557,9 +573,6 @@ class MessageProcessor:
                                         server=server_name,
                                         error=str(e))
                 
-                # Refresh server discovery
-                await self.discord_service._discover_servers_with_retry()
-                
                 # Clean invalid Telegram topics
                 cleaned_topics = await self.telegram_service._clean_invalid_topics()
                 
@@ -573,7 +586,7 @@ class MessageProcessor:
                 await asyncio.sleep(60)  # Wait 1 minute on error
     
     async def _sync_server_fallback(self, server_name: str) -> None:
-        """ИСПРАВЛЕНО: Fallback sync for a single server (announcement channels only)"""
+        """ИСПРАВЛЕНО: Fallback sync for a single server (all monitored channels)"""
         if server_name not in self.discord_service.servers:
             return
         
@@ -583,10 +596,10 @@ class MessageProcessor:
         
         fallback_messages = []
         
-        # ИСПРАВЛЕНИЕ: Get messages only from announcement channels
+        # ИСПРАВЛЕНИЕ: Get messages from ALL monitored channels
         for channel_id, channel_info in server_info.accessible_channels.items():
-            # Проверяем что это announcement канал
-            if not self._is_announcement_channel(channel_info.channel_name):
+            # Проверяем что канал мониторится (любой добавленный)
+            if channel_id not in self.discord_service.monitored_announcement_channels:
                 continue
             
             try:
@@ -614,12 +627,18 @@ class MessageProcessor:
             fallback_messages.sort(key=lambda x: x.timestamp, reverse=False)
             sent_count = await self.telegram_service.send_messages_batch(fallback_messages)
             
-            self.logger.info("Fallback sync completed (announcement channels)",
+            # Count types for logging
+            announcement_count = sum(1 for msg in fallback_messages 
+                                   if self._is_announcement_channel(msg.channel_name))
+            regular_count = len(fallback_messages) - announcement_count
+            
+            self.logger.info("Fallback sync completed (monitored channels)",
                        server=server_name,
                        messages_sent=sent_count,
                        total_messages=len(fallback_messages),
+                       announcement_messages=announcement_count,
+                       regular_messages=regular_count,
                        oldest_first=True)
-            
             
             # Update sync time
             self.last_sync_times[server_name] = datetime.now()
@@ -774,12 +793,16 @@ class MessageProcessor:
         except Exception as e:
             enhanced_features = {"error": str(e), "available": False}
         
-        # Подсчет announcement каналов
+        # Подсчет типов каналов
         announcement_channels = 0
+        manually_added_channels = 0
         for server_info in self.discord_service.servers.values():
-            for channel_info in server_info.accessible_channels.values():
-                if self._is_announcement_channel(channel_info.channel_name):
-                    announcement_channels += 1
+            for channel_id, channel_info in server_info.accessible_channels.items():
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    if self._is_announcement_channel(channel_info.channel_name):
+                        announcement_channels += 1
+                    else:
+                        manually_added_channels += 1
         
         return {
             "system": {
@@ -789,12 +812,13 @@ class MessageProcessor:
                 "health_score": self.stats.health_score,
                 "status": self.stats.status,
                 "realtime_enabled": self.realtime_enabled,
-                "version": "Enhanced версия с bot interface"  # ОБНОВЛЕНО
+                "version": "Enhanced версия с bot interface и universal monitoring"  # ОБНОВЛЕНО
             },
             "discord": {
                 **discord_stats,
-                "announcement_channels": announcement_channels,
-                "announcement_only": True
+                "auto_discovered_announcement": announcement_channels,
+                "manually_added_channels": manually_added_channels,
+                "monitoring_strategy": "auto announcement + manual any"
             },
             "telegram": {
                 "topics": len(self.telegram_service.server_topics),
@@ -826,7 +850,13 @@ class MessageProcessor:
                     "last_sync": self.last_sync_times.get(server_name, datetime.now()).isoformat(),
                     "announcement_channels": len([
                         ch for ch in self.discord_service.servers[server_name].accessible_channels.values()
-                        if self._is_announcement_channel(ch.channel_name)
+                        if ch.channel_id in self.discord_service.monitored_announcement_channels
+                        and self._is_announcement_channel(ch.channel_name)
+                    ]) if server_name in self.discord_service.servers else 0,
+                    "manually_added_channels": len([
+                        ch for ch in self.discord_service.servers[server_name].accessible_channels.values()
+                        if ch.channel_id in self.discord_service.monitored_announcement_channels
+                        and not self._is_announcement_channel(ch.channel_name)
                     ]) if server_name in self.discord_service.servers else 0
                 }
                 for server_name in self.discord_service.servers.keys()

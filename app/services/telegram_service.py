@@ -59,14 +59,21 @@ class TelegramService:
         # Load existing data
         self._load_persistent_data()
     
+    def _is_announcement_channel(self, channel_name: str) -> bool:
+        """ИСПРАВЛЕНО: Проверка что канал является announcement"""
+        channel_lower = channel_name.lower()
+        announcement_keywords = ['announcement', 'announcements', 'announce']
+        
+        return any(keyword in channel_lower for keyword in announcement_keywords)
+    
     def _initialize_bot(self):
         """ИСПРАВЛЕНИЕ: Правильная инициализация бота"""
         try:
             self.bot = telebot.TeleBot(
                 self.settings.telegram_bot_token,
                 skip_pending=True,
-                threaded=False,  # ИСПРАВЛЕНО: отключаем threading для лучшего контроля
-                parse_mode=None  # ИСПРАВЛЕНО: отключаем автоматический parse_mode
+                threaded=False,  
+                parse_mode=None  
             )
             
             # ИСПРАВЛЕНИЕ: Сразу устанавливаем обработчики
@@ -499,6 +506,7 @@ class TelegramService:
                 )
                 return
             
+            # ИСПРАВЛЕНИЕ: Получаем серверы из discord_service
             servers = getattr(self.discord_service, 'servers', {})
             
             if not servers:
@@ -514,11 +522,10 @@ class TelegramService:
             
             markup = InlineKeyboardMarkup()
             for server_name in list(servers.keys())[:10]:  # Limit to first 10 servers
-                # Add topic indicator with duplicate check
+                # Add topic indicator
                 topic_indicator = ""
                 if server_name in self.server_topics:
                     topic_id = self.server_topics[server_name]
-                    # Quick check without async
                     try:
                         topic_info = self.bot.get_forum_topic(
                             chat_id=self.settings.telegram_chat_id,
@@ -786,13 +793,15 @@ class TelegramService:
             self.logger.error(f"Error in verify topics: {e}")
     
     def _handle_server_selected(self, call):
-        """Handle server selection"""
+        """ИСПРАВЛЕНО: Handle server selection"""
         try:
             server_name = call.data.replace('server_', '', 1)
             
+            # ИСПРАВЛЕНИЕ: Используем server_channel_mappings из settings
             if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
                 self.bot.answer_callback_query(call.id, "❌ Server not found")
                 return
+
             
             server_info = self.discord_service.servers[server_name]
             channels = getattr(server_info, 'accessible_channels', {})
@@ -991,7 +1000,7 @@ class TelegramService:
             self.logger.error(f"Error canceling add channel: {e}")
     
     def _process_channel_id_input(self, message, user_state):
-        """Process channel ID input from user"""
+        """ИСПРАВЛЕНО: Process channel ID input - ЛЮБЫЕ каналы"""
         try:
             channel_id = message.text.strip()
             server_name = user_state['server_name']
@@ -1006,31 +1015,96 @@ class TelegramService:
                 )
                 return
             
-            # Try to get channel name from Discord service
+            # Получаем информацию о канале
             channel_name = f"Channel_{channel_id}"
-            if self.discord_service:
+            channel_accessible = False
+            channel_type_info = "Unknown"
+            
+            if self.discord_service and hasattr(self.discord_service, 'sessions') and self.discord_service.sessions:
                 try:
-                    # Here you would implement channel name fetching
-                    # For now, we'll use the default name
-                    pass
+                    session = self.discord_service.sessions[0]
+                    
+                    import asyncio
+                    import concurrent.futures
+                    
+                    async def get_channel_info():
+                        try:
+                            await self.discord_service.rate_limiter.wait_if_needed(f"channel_info_{channel_id}")
+                            
+                            async with session.get(f'https://discord.com/api/v9/channels/{channel_id}') as response:
+                                if response.status == 200:
+                                    channel_data = await response.json()
+                                    name = channel_data.get('name', f'Channel_{channel_id}')
+                                    channel_type = channel_data.get('type', 0)
+                                    
+                                    # Тестируем доступность
+                                    async with session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1') as msg_response:
+                                        accessible = msg_response.status == 200
+                                        
+                                    # Определяем тип канала
+                                    type_info = "Text Channel" if channel_type == 0 else f"Type {channel_type}"
+                                    
+                                    return name, accessible, type_info
+                                elif response.status == 404:
+                                    return f"Channel_{channel_id}", False, "Not Found"
+                                elif response.status == 403:
+                                    return f"Channel_{channel_id}", False, "No Access"
+                                else:
+                                    return f"Channel_{channel_id}", False, f"Error {response.status}"
+                        except Exception:
+                            return f"Channel_{channel_id}", False, "Unknown"
+                    
+                    def run_channel_check():
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            return new_loop.run_until_complete(get_channel_info())
+                        finally:
+                            new_loop.close()
+                    
+                    try:
+                        with concurrent.futures.ThreadPoolExecutor() as executor:
+                            future = executor.submit(run_channel_check)
+                            channel_name, channel_accessible, channel_type_info = future.result(timeout=8)
+                    except Exception as e:
+                        self.logger.warning(f"Error getting channel info: {e}")
+                        
                 except Exception as e:
-                    self.logger.debug(f"Could not get channel info: {e}")
+                    self.logger.warning(f"Discord service error: {e}")
             
-            # Save channel name in state
+            # Save channel info in state
             self.user_states[message.from_user.id]['channel_name'] = channel_name
+            self.user_states[message.from_user.id]['channel_accessible'] = channel_accessible
             
-            # Show confirmation
+            # Статус доступности
+            if channel_accessible:
+                access_status = "✅ Accessible"
+            elif channel_type_info in ["Not Found", "No Access"]:
+                access_status = f"❌ {channel_type_info}"
+            else:
+                access_status = "⚠️ Status unknown"
+            
+            # Информация о мониторинге - ЛЮБОЙ добавленный канал будет мониториться
+            monitoring_info = "🔔 **WILL BE MONITORED** - Messages will be forwarded to Telegram"
+            monitoring_emoji = "✅"
+            
             confirmation_text = (
                 f"🔍 **Channel Information**\n\n"
-                f"Server: {server_name}\n"
+                f"Server: **{server_name}**\n"
                 f"Channel ID: `{channel_id}`\n"
-                f"Channel Name: {channel_name}\n\n"
-                f"➕ Add this channel to monitoring?"
+                f"Channel Name: **{channel_name}**\n"
+                f"Type: {channel_type_info}\n"
+                f"Access Status: {access_status}\n\n"
+                f"{monitoring_emoji} **Monitoring Status:**\n"
+                f"{monitoring_info}\n\n"
+                f"💡 **Note:** All manually added channels are monitored for messages.\n\n"
             )
+            
+            confirmation_text += "➕ **Add this channel to monitoring?**"
             
             markup = InlineKeyboardMarkup()
             markup.add(
-                InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_add_{server_name}_{channel_id}"),
+                InlineKeyboardButton("✅ Add Channel", callback_data=f"confirm_add_{server_name}_{channel_id}"),
                 InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_add_{server_name}")
             )
             
@@ -1050,15 +1124,19 @@ class TelegramService:
                     parse_mode='Markdown'
                 )
             except Exception as e:
-                # If edit fails, send new message
                 self.bot.send_message(
                     message.chat.id,
                     confirmation_text,
                     reply_markup=markup,
                     parse_mode='Markdown'
                 )
+                
         except Exception as e:
             self.logger.error(f"Error processing channel ID input: {e}")
+            try:
+                self.bot.reply_to(message, f"❌ Error processing channel ID: {str(e)}")
+            except:
+                pass
     
     def _send_servers_list_message(self, message):
         """Send servers list as a new message"""
@@ -1067,6 +1145,7 @@ class TelegramService:
                 self.bot.reply_to(message, "❌ Discord service not available")
                 return
             
+            # ИСПРАВЛЕНИЕ: Получаем серверы из discord_service
             servers = getattr(self.discord_service, 'servers', {})
             
             if not servers:
@@ -1077,13 +1156,28 @@ class TelegramService:
             
             for server_name in list(servers.keys())[:10]:
                 topic_id = self.server_topics.get(server_name)
+                server_info = servers[server_name]
+                channel_count = getattr(server_info, 'channel_count', 0)
+                
                 if topic_id:
-                    text += f"• {server_name} - Topic: {topic_id}\n"
+                    try:
+                        topic_info = self.bot.get_forum_topic(
+                            chat_id=self.settings.telegram_chat_id,
+                            message_thread_id=topic_id
+                        )
+                        status = "✅" if topic_info else "❌"
+                    except:
+                        status = "❌"
+                    
+                    text += f"• {server_name} - Topic: {topic_id} {status} ({channel_count} channels)\n"
                 else:
-                    text += f"• {server_name} - No topic\n"
+                    text += f"• {server_name} - No topic ({channel_count} channels)\n"
             
             if len(servers) > 10:
                 text += f"\n... and {len(servers) - 10} more servers"
+            
+            text += f"\n\n📊 Total channels: {sum(getattr(s, 'channel_count', 0) for s in servers.values())}"
+            text += f"\n🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}"
             
             self.bot.reply_to(message, text, parse_mode='Markdown')
             
@@ -1092,29 +1186,124 @@ class TelegramService:
             self.bot.reply_to(message, f"❌ Error: {str(e)}")
     
     def add_channel_to_server(self, server_name: str, channel_id: str, channel_name: str = None) -> tuple[bool, str]:
-        """Enhanced channel addition with Discord service integration"""
+        """ИСПРАВЛЕНО: Добавление ЛЮБЫХ каналов, не только announcement"""
         try:
             # Check if Discord service is available
             if not self.discord_service:
                 return False, "Discord service not available"
             
-            # Check if server exists
             servers = getattr(self.discord_service, 'servers', {})
             if server_name not in servers:
                 return False, "Server not found in Discord service"
             
-            # Use Discord service to add channel
-            if hasattr(self.discord_service, 'notify_new_channel_added'):
-                success = self.discord_service.notify_new_channel_added(
-                    server_name, channel_id, channel_name or f"Channel_{channel_id}"
-                )
-                
-                if success:
-                    return True, "Channel successfully added to monitoring"
-                else:
-                    return False, "Failed to add channel to Discord service"
+            server_info = servers[server_name]
+            
+            # Проверяем лимиты
+            current_channel_count = len(server_info.channels)
+            max_channels = getattr(server_info, 'max_channels', 5)
+            
+            if current_channel_count >= max_channels:
+                return False, f"Server has reached maximum channels limit ({max_channels})"
+            
+            # Проверяем что канал еще не добавлен
+            if channel_id in server_info.channels:
+                return False, "Channel is already added to this server"
+            
+            # Создаем channel_info
+            from ..models.server import ChannelInfo
+            from datetime import datetime
+            
+            channel_name_final = channel_name or f"Channel_{channel_id}"
+            
+            new_channel_info = ChannelInfo(
+                channel_id=channel_id,
+                channel_name=channel_name_final,
+                http_accessible=True,
+                websocket_accessible=True,
+                last_checked=datetime.now()
+            )
+            
+            # Тестируем доступность канала через Discord API
+            if hasattr(self.discord_service, 'sessions') and self.discord_service.sessions:
+                try:
+                    import asyncio
+                    import concurrent.futures
+                    
+                    async def test_channel_access():
+                        try:
+                            session = self.discord_service.sessions[0]
+                            await self.discord_service.rate_limiter.wait_if_needed(f"test_channel_{channel_id}")
+                            
+                            # Тестируем доступность и получаем имя
+                            async with session.get(f'https://discord.com/api/v9/channels/{channel_id}') as response:
+                                if response.status == 200:
+                                    channel_data = await response.json()
+                                    real_name = channel_data.get('name', channel_name_final)
+                                    
+                                    # Тестируем доступ к сообщениям
+                                    async with session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1') as msg_response:
+                                        accessible = msg_response.status == 200
+                                        return accessible, real_name
+                                return False, channel_name_final
+                        except Exception:
+                            return False, channel_name_final
+                    
+                    def run_test():
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        try:
+                            return new_loop.run_until_complete(test_channel_access())
+                        finally:
+                            new_loop.close()
+                    
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(run_test)
+                        try:
+                            is_accessible, real_channel_name = future.result(timeout=10)
+                            new_channel_info.http_accessible = is_accessible
+                            new_channel_info.channel_name = real_channel_name
+                            channel_name_final = real_channel_name
+                        except Exception as e:
+                            self.logger.warning(f"Error testing channel {channel_id}: {e}")
+                            
+                except Exception as e:
+                    self.logger.warning(f"Error in channel testing: {e}")
+            
+            # Добавляем канал в server_info
+            server_info.channels[channel_id] = new_channel_info
+            
+            if not hasattr(server_info, 'accessible_channels'):
+                server_info.accessible_channels = {}
+            server_info.accessible_channels[channel_id] = new_channel_info
+            
+            # ИСПРАВЛЕНО: Добавляем в monitored channels ЛЮБОЙ вручную добавленный канал
+            is_announcement = self._is_announcement_channel(channel_name_final)
+            
+            if hasattr(self.discord_service, 'monitored_announcement_channels'):
+                self.discord_service.monitored_announcement_channels.add(channel_id)
+                self.logger.info(f"✅ Added '{channel_name_final}' to monitored channels (manually added)")
+            
+            # Обновляем статистику
+            server_info.update_stats()
+            
+            # Сообщение об успехе
+            success_message = f"✅ Channel successfully added and will be monitored! Server now has {len(server_info.channels)} channels.\n\n"
+            
+            if is_announcement:
+                success_message += "📢 This is an ANNOUNCEMENT channel - messages will be forwarded to Telegram."
             else:
-                return False, "Discord service does not support channel addition"
+                success_message += "📝 This is a regular channel - messages will be forwarded to Telegram."
+            
+            success_message += "\n🔔 Channel is now being monitored for new messages."
+            
+            # Уведомляем Discord service
+            if hasattr(self.discord_service, 'notify_new_channel_added'):
+                try:
+                    self.discord_service.notify_new_channel_added(server_name, channel_id, channel_name_final)
+                except Exception as e:
+                    self.logger.warning(f"Could not notify Discord service: {e}")
+            
+            return True, success_message
             
         except Exception as e:
             self.logger.error(f"❌ Error adding channel to server: {e}")
@@ -1482,7 +1671,9 @@ class TelegramService:
             self.logger.error("Bot not initialized, cannot start")
             return
         
+        self._setup_bot_handlers()
         self.bot_running = True
+        
         
         self.logger.info("Starting Enhanced Telegram bot", 
                        chat_id=self.settings.telegram_chat_id,
