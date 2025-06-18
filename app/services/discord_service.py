@@ -76,11 +76,9 @@ class DiscordService:
                 self.logger.error("Error in message callback", error=str(e))
     
     def _is_announcement_channel(self, channel_name: str) -> bool:
-        """ИСПРАВЛЕНО: Проверка что канал является announcement"""
+        """Проверка что канал является announcement (строгое точное совпадение)"""
         channel_lower = channel_name.lower()
-        announcement_keywords = ['announcement', 'announcements', 'announce']
-        
-        return any(keyword in channel_lower for keyword in announcement_keywords)
+        return channel_lower in self.settings.channel_keywords
     
     async def initialize(self) -> bool:
         """Initialize Discord service - только announcement каналы"""
@@ -351,23 +349,36 @@ class DiscordService:
                     await asyncio.sleep(self.base_delay * (2 ** attempt))
     
     def _find_announcement_channels_only(self, channels: List[dict]) -> List[dict]:
-        """ИСПРАВЛЕНО: Найти ТОЛЬКО announcement каналы"""
+        """ИСПРАВЛЕНО: Найти announcement каналы (с учетом emoji)"""
         announcement_channels = []
         
         for channel in channels:
             if channel.get('type') not in [0, 5]:  # Text channels and announcement channels
                 continue
                 
-            channel_name = channel['name'].lower()
+            # Удаляем emoji и лишние пробелы из названия
+            clean_name = ''.join([c for c in channel['name'] if c.isalpha() or c.isspace()])
+            clean_name = ' '.join(clean_name.split()).lower()
             
-            # ИСПРАВЛЕНО: Строгая проверка на announcement
-            announcement_keywords = ['announcement', 'announcements', 'announce']
-            
-            if any(keyword in channel_name for keyword in announcement_keywords):
-                announcement_channels.append(channel)
-                self.logger.info("Found announcement channel", 
-                               channel_name=channel['name'],
-                               channel_id=channel['id'])
+            # Проверяем содержит ли очищенное название любое из ключевых слов
+            for keyword in self.settings.channel_keywords:
+                if keyword in clean_name:
+                    announcement_channels.append(channel)
+                    self.logger.info(
+                        "Found announcement channel match", 
+                        original_name=channel['name'],
+                        cleaned_name=clean_name,
+                        channel_id=channel['id'],
+                        matched_keyword=keyword
+                    )
+                    break
+            else:
+                self.logger.debug(
+                    "Channel name doesn't match keywords", 
+                    original_name=channel['name'],
+                    cleaned_name=clean_name,
+                    expected_keywords=self.settings.channel_keywords
+                )
         
         self.logger.info("Total announcement channels found", count=len(announcement_channels))
         return announcement_channels

@@ -203,11 +203,9 @@ class MessageProcessor:
                             remaining_count=len(self.processed_message_hashes))
     
     def _is_announcement_channel(self, channel_name: str) -> bool:
-        """ИСПРАВЛЕНО: Проверка что канал является announcement"""
+        """Проверка что канал является announcement (строгое точное совпадение)"""
         channel_lower = channel_name.lower()
-        announcement_keywords = ['announcement', 'announcements', 'announce']
-        
-        return any(keyword in channel_lower for keyword in announcement_keywords)
+        return channel_lower in self.settings.channel_keywords
     
     def _check_rate_limit(self, server_name: str, is_realtime: bool = False) -> bool:
         """ИСПРАВЛЕНО: Check if server is within rate limits"""

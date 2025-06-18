@@ -60,11 +60,16 @@ class TelegramService:
         self._load_persistent_data()
     
     def _is_announcement_channel(self, channel_name: str) -> bool:
-        """ИСПРАВЛЕНО: Проверка что канал является announcement"""
-        channel_lower = channel_name.lower()
-        announcement_keywords = ['announcement', 'announcements', 'announce']
+        """Проверка что канал является announcement (с учетом emoji)"""
+        # Удаляем emoji и лишние пробелы из названия
+        clean_name = ''.join([c for c in channel_name if c.isalpha() or c.isspace()])
+        clean_name = ' '.join(clean_name.split()).lower()
         
-        return any(keyword in channel_lower for keyword in announcement_keywords)
+        # Проверяем содержит ли очищенное название любое из ключевых слов
+        for keyword in self.settings.channel_keywords:
+            if keyword in clean_name:
+                return True
+        return False
     
     def _initialize_bot(self):
         """ИСПРАВЛЕНИЕ: Правильная инициализация бота"""

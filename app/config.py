@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     use_topics: bool = Field(default=True, env="TELEGRAM_USE_TOPICS")
     show_timestamps: bool = Field(default=True)
     show_server_in_message: bool = Field(default=True)
+
+    # Channel Configuration
+    channel_keywords: List[str] = Field(
+        default=['announcement', 'announcements', 'announce'],
+        description="Keywords to identify announcement channels"
+    )
     
     # Monitoring & Logging
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
