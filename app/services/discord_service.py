@@ -13,7 +13,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class DiscordService:
-    """Исправленный Discord service -  auto announcement + manually added каналы"""
+    """Discord service -  auto announcement + manually added каналы"""
     
     def __init__(self, 
                  settings: Settings,

@@ -13,7 +13,7 @@ from .discord_service import DiscordService
 from .telegram_service import TelegramService
 
 class MessageProcessor:
-    """ИСПРАВЛЕННЫЙ главный оркестратор - auto announcement + manually added каналы"""
+    """главный оркестратор - auto announcement + manually added каналы"""
     
     def __init__(self,
                  settings: Settings,
@@ -64,7 +64,7 @@ class MessageProcessor:
         
     async def initialize(self) -> bool:
         """Initialize all services and set up real-time integration"""
-        self.logger.info("Initializing ИСПРАВЛЕННЫЙ Message Processor")
+        self.logger.info("Initializing Message Processor")
         
         # Initialize Discord service
         if not await self.discord_service.initialize():
@@ -92,7 +92,7 @@ class MessageProcessor:
         # Update initial statistics
         await self._update_stats()
         
-        self.logger.info("ИСПРАВЛЕННЫЙ Message Processor initialized successfully",
+        self.logger.info("Message Processor initialized successfully",
                         discord_servers=len(self.discord_service.servers),
                         telegram_topics=len(self.telegram_service.server_topics),
                         realtime_enabled=self.realtime_enabled,
@@ -247,7 +247,7 @@ class MessageProcessor:
         self.running = True
         self.start_time = datetime.now()
         
-        self.logger.info("Starting ИСПРАВЛЕННЫЙ Message Processor with enhanced deduplication")
+        self.logger.info("Starting Message Processor with enhanced deduplication")
         
         # Start background tasks
         self.tasks = [
@@ -272,7 +272,7 @@ class MessageProcessor:
         # Perform initial sync (все monitored каналы)
         await self._perform_initial_sync()
         
-        self.logger.info("ИСПРАВЛЕННЫЙ Message Processor started successfully")
+        self.logger.info("Message Processor started successfully")
         
         try:
             # Wait for all tasks with error isolation
@@ -295,7 +295,7 @@ class MessageProcessor:
             return
         
         self.running = False
-        self.logger.info("Stopping ИСПРАВЛЕННЫЙ Message Processor")
+        self.logger.info("Stopping Message Processor")
         
         # Cancel all tasks
         for task in self.tasks:
@@ -309,7 +309,7 @@ class MessageProcessor:
         await self.discord_service.cleanup()
         await self.telegram_service.cleanup()
         
-        self.logger.info("ИСПРАВЛЕННЫЙ Message Processor stopped")
+        self.logger.info("Message Processor stopped")
     
     async def _perform_initial_sync(self) -> None:
         """ИСПРАВЛЕНО: Perform initial synchronization of monitored channels"""

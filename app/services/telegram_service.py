@@ -16,7 +16,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class TelegramService:
-    """ИСПРАВЛЕННЫЙ Telegram service с рабочими функциями бота"""
+    """Telegram service с рабочими функциями бота"""
     
     def __init__(self, 
                  settings: Settings,
@@ -77,7 +77,7 @@ class TelegramService:
             self.bot = telebot.TeleBot(
                 self.settings.telegram_bot_token,
                 skip_pending=True,
-                threaded=False,  
+                threaded=True,  
                 parse_mode=None  
             )
             
@@ -870,7 +870,7 @@ class TelegramService:
             self.logger.error(f"Error in server selected: {e}")
     
     def _handle_get_messages(self, call):
-        """Handle get messages request"""
+        """Handle get messages request with actual message retrieval"""
         try:
             server_name = call.data.replace('get_messages_', '', 1)
             
@@ -890,20 +890,52 @@ class TelegramService:
                 self.bot.answer_callback_query(call.id, "❌ No channels found for this server")
                 return
             
-            # Get first channel for example
+            # Get messages from first channel
             channel_id, channel_info = next(iter(channels.items()))
+            channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
             
-            # Simulate getting messages
-            message_count = 5  # Simulated
+            # Try to get actual messages
+            messages = []
+            if hasattr(self.discord_service, 'get_channel_messages'):
+                messages = self.discord_service.get_channel_messages(channel_id, limit=5)
             
-            self.bot.answer_callback_query(
-                call.id,
-                f"✅ Sent {message_count} messages from {server_name}"
-            )
+            if messages:
+                text = f"📋 Last {len(messages)} messages from {channel_name}:\n\n"
+                for msg in messages:
+                    text += f"• {msg['author']}: {msg['content'][:50]}...\n"
+                    if len(msg['content']) > 50:
+                        text += f"   (full message: {msg['content']})\n"
+                
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"server_{server_name}"))
+                
+                self.bot.edit_message_text(
+                    text,
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup,
+                    parse_mode=None
+                )
+            else:
+                self.bot.answer_callback_query(
+                    call.id,
+                    f"ℹ️ No recent messages found in {channel_name}"
+                )
             
         except Exception as e:
             self.logger.error(f"Error getting messages: {e}")
             self.bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+            try:
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"server_{server_name}"))
+                self.bot.edit_message_text(
+                    f"❌ Error retrieving messages: {str(e)}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except:
+                pass
     
     def _handle_add_channel_request(self, call):
         """Handle add channel request"""
@@ -1343,6 +1375,8 @@ class TelegramService:
         except Exception as e:
             self.logger.error(f"Error adding channel to server: {e}")
             return False, f"Error adding channel: {str(e)}"
+
+
     
     async def get_or_create_server_topic(self, server_name: str) -> Optional[int]:
         """ENHANCED: Get or create topic with anti-duplicate protection"""
