@@ -904,6 +904,112 @@ async def get_monitored_channels(
         "note": "All these channels forward messages to the same Telegram topic"
     }
 
+@app.delete("/servers/{server_name}/channels/{channel_id}")
+async def remove_channel_from_server(
+    server_name: str,
+    channel_id: str,
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency),
+    discord_service: DiscordService = Depends(get_discord_service_dependency)
+):
+    """Remove a channel from server monitoring"""
+    try:
+        # Проверяем что сервер существует
+        if server_name not in discord_service.servers:
+            raise HTTPException(status_code=404, detail="Server not found")
+        
+        # Проверяем что канал существует и мониторится
+        server_info = discord_service.servers[server_name]
+        if channel_id not in server_info.channels:
+            raise HTTPException(status_code=404, detail="Channel not found in server")
+        
+        if channel_id not in discord_service.monitored_announcement_channels:
+            raise HTTPException(status_code=400, detail="Channel is not being monitored")
+        
+        # Используем функцию из telegram_service
+        success, message = telegram_service.remove_channel_from_server(server_name, channel_id)
+        
+        if success:
+            # Получаем обновленную информацию
+            remaining_monitored = len([
+                ch_id for ch_id in server_info.channels.keys() 
+                if ch_id in discord_service.monitored_announcement_channels
+            ])
+            
+            # Получаем информацию о канале
+            channel_info = server_info.channels[channel_id]
+            channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
+            is_announcement = telegram_service._is_announcement_channel(channel_name)
+            
+            return {
+                "message": "Channel removed from monitoring successfully",
+                "server_name": server_name,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "channel_type": "announcement" if is_announcement else "regular",
+                "remaining_monitored_channels": remaining_monitored,
+                "details": message,
+                "note": "Channel still exists in Discord but will no longer forward messages"
+            }
+        else:
+            raise HTTPException(status_code=400, detail=message)
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/servers/{server_name}/monitored-channels/detailed")
+async def get_detailed_monitored_channels(
+    server_name: str,
+    discord_service: DiscordService = Depends(get_discord_service_dependency),
+    telegram_service: TelegramService = Depends(get_telegram_service_dependency)
+):
+    """Get detailed information about monitored channels for a server"""
+    if server_name not in discord_service.servers:
+        raise HTTPException(status_code=404, detail="Server not found")
+    
+    server_info = discord_service.servers[server_name]
+    monitored_channels = []
+    
+    for channel_id, channel_info in server_info.channels.items():
+        if channel_id in discord_service.monitored_announcement_channels:
+            is_announcement = telegram_service._is_announcement_channel(channel_info.channel_name)
+            
+            monitored_channels.append({
+                "channel_id": channel_id,
+                "channel_name": channel_info.channel_name,
+                "channel_type": "announcement" if is_announcement else "regular",
+                "monitoring_reason": "Auto-discovered" if is_announcement else "Manually added",
+                "http_accessible": channel_info.http_accessible,
+                "websocket_accessible": channel_info.websocket_accessible,
+                "message_count": getattr(channel_info, 'message_count', 0),
+                "last_message_time": channel_info.last_message_time.isoformat() if channel_info.last_message_time else None,
+                "last_checked": channel_info.last_checked.isoformat() if channel_info.last_checked else None,
+                "can_remove": True  # All monitored channels can be removed
+            })
+    
+    # Статистика по типам каналов
+    announcement_count = len([ch for ch in monitored_channels if ch["channel_type"] == "announcement"])
+    regular_count = len([ch for ch in monitored_channels if ch["channel_type"] == "regular"])
+    
+    return {
+        "server_name": server_name,
+        "monitored_channels": monitored_channels,
+        "summary": {
+            "total_monitored": len(monitored_channels),
+            "announcement_channels": announcement_count,
+            "manually_added_channels": regular_count,
+            "total_server_channels": len(server_info.channels),
+            "accessible_channels": len(server_info.accessible_channels)
+        },
+        "telegram_topic_id": telegram_service.server_topics.get(server_name),
+        "management_info": {
+            "all_channels_removable": True,
+            "removal_method": "Bot interface or API",
+            "note": "All monitored channels forward to the same Telegram topic"
+        }
+    }
+
 # Остальные эндпоинты остаются без изменений...
 # (все остальные методы из исходного файла сохраняются)
 

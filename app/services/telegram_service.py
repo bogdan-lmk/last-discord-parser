@@ -158,12 +158,12 @@ class TelegramService:
         
         @self.bot.callback_query_handler(func=lambda call: True)
         def handle_callback_query(call):
-            """ИСПРАВЛЕНИЕ: Обработчик callback запросов"""
+            """ОБНОВЛЕННЫЙ: Обработчик callback запросов с функцией удаления каналов"""
             try:
                 data = call.data
                 self.logger.info(f"📞 Callback received: {data} from user {call.from_user.id}")
                 
-                # ИСПРАВЛЕНИЕ: Сначала отвечаем на callback
+                # Отвечаем на callback
                 try:
                     self.bot.answer_callback_query(call.id, "⏳ Обработка...")
                 except Exception as e:
@@ -183,7 +183,6 @@ class TelegramService:
                 elif data == "help":
                     self._handle_help(call)
                 elif data == "start":
-                    # ИСПРАВЛЕНИЕ: Вызываем обработчик welcome через сообщение
                     send_welcome(call.message)
                 elif data == "verify":
                     self._handle_verify_topics(call)
@@ -197,6 +196,19 @@ class TelegramService:
                     self._handle_confirm_add_channel(call)
                 elif data.startswith("cancel_add_"):
                     self._handle_cancel_add_channel(call)
+                # НОВЫЕ ОБРАБОТЧИКИ ДЛЯ УДАЛЕНИЯ КАНАЛОВ
+                elif data.startswith("remove_channel_"):
+                    self._handle_remove_channel_request(call)
+                elif data.startswith("confirm_remove_"):
+                    self._handle_confirm_remove_channel(call)
+                elif data.startswith("final_remove_"):
+                    self._handle_final_remove_channel(call)
+                elif data.startswith("manage_channels_"):
+                    self._handle_manage_channels(call)
+                elif data.startswith("channel_stats_"):
+                    self._handle_channel_stats(call)
+                elif data.startswith("show_all_remove_"):
+                    self._handle_show_all_removable(call)
                 else:
                     self.logger.warning(f"⚠️ Unknown callback data: {data}")
                     try:
@@ -798,19 +810,29 @@ class TelegramService:
             self.logger.error(f"Error in verify topics: {e}")
     
     def _handle_server_selected(self, call):
-        """ИСПРАВЛЕНО: Handle server selection"""
+        """ОБНОВЛЕННЫЙ: Handle server selection с кнопкой управления каналами"""
         try:
             server_name = call.data.replace('server_', '', 1)
             
-            # ИСПРАВЛЕНИЕ: Используем server_channel_mappings из settings
             if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
                 self.bot.answer_callback_query(call.id, "❌ Server not found")
                 return
 
-            
             server_info = self.discord_service.servers[server_name]
             channels = getattr(server_info, 'accessible_channels', {})
-            channel_count = len(channels)
+            
+            # Подсчет мониторимых каналов
+            monitored_channels = {}
+            announcement_count = 0
+            regular_count = 0
+            
+            for channel_id, channel_info in channels.items():
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    monitored_channels[channel_id] = channel_info
+                    if self._is_announcement_channel(channel_info.channel_name):
+                        announcement_count += 1
+                    else:
+                        regular_count += 1
             
             # Topic information
             topic_info = ""
@@ -829,28 +851,37 @@ class TelegramService:
             
             text = (
                 f"**{server_name}**\n\n"
-                f"📊 Channels: {channel_count}\n"
+                f"📊 Total channels: {len(channels)}\n"
+                f"🔔 Monitored channels: {len(monitored_channels)}\n"
+                f"📢 Announcement: {announcement_count}\n"
+                f"📝 Regular: {regular_count}\n"
                 f"{topic_info}\n\n"
-                f"📋 **Configured Channels:**\n"
+                f"📋 **Monitored Channels:**\n"
             )
             
-            # Show channels
-            if channels:
-                for channel_id, channel_info in list(channels.items())[:10]:
+            # Show monitored channels
+            if monitored_channels:
+                for channel_id, channel_info in list(monitored_channels.items())[:8]:  # Show max 8
                     channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
-                    text += f"• {channel_name} (`{channel_id}`)\n"
-                if len(channels) > 10:
-                    text += f"• ... and {len(channels) - 10} more channels\n"
+                    channel_type = "📢" if self._is_announcement_channel(channel_name) else "📝"
+                    text += f"• {channel_type} {channel_name}\n"
+                
+                if len(monitored_channels) > 8:
+                    text += f"• ... and {len(monitored_channels) - 8} more\n"
             else:
-                text += "• No channels configured\n"
+                text += "• No channels being monitored\n"
             
             markup = InlineKeyboardMarkup()
             
             # Action buttons
-            if channels:
+            if monitored_channels:
                 markup.add(
                     InlineKeyboardButton("📥 Get Messages", callback_data=f"get_messages_{server_name}"),
                     InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
+                )
+                markup.add(
+                    InlineKeyboardButton("🗑️ Remove Channel", callback_data=f"remove_channel_{server_name}"),
+                    InlineKeyboardButton("📋 Manage Channels", callback_data=f"manage_channels_{server_name}")
                 )
             else:
                 markup.add(
@@ -869,6 +900,452 @@ class TelegramService:
         except Exception as e:
             self.logger.error(f"Error in server selected: {e}")
     
+
+
+    def add_channel_to_server(self, server_name: str, channel_id: str, channel_name: str = None) -> tuple[bool, str]:
+        """Add any channel to a server and enable monitoring"""
+        try:
+            self.logger.info(f"Adding channel to server: {server_name}, channel_id: {channel_id}, name: {channel_name}")
+            
+            # Check if Discord service is available
+            if not self.discord_service:
+                return False, "Discord service not available"
+            
+            servers = getattr(self.discord_service, 'servers', {})
+            if server_name not in servers:
+                return False, f"Server '{server_name}' not found in Discord service"
+            
+            server_info = servers[server_name]
+            
+            # Check limits
+            current_channel_count = len(server_info.channels)
+            max_channels = getattr(server_info, 'max_channels', 5)
+            
+            if current_channel_count >= max_channels:
+                return False, f"Server has reached maximum channels limit ({max_channels})"
+            
+            # Check if channel is already added
+            if channel_id in server_info.channels:
+                # If already added, just ensure it's monitored
+                if hasattr(self.discord_service, 'monitored_announcement_channels'):
+                    self.discord_service.monitored_announcement_channels.add(channel_id)
+                    self.logger.info(f"Channel {channel_id} already exists - ensuring it's monitored")
+                    return True, "Channel is already added and will be monitored"
+                return False, "Channel is already added to this server"
+            
+            # Create channel_info
+            from ..models.server import ChannelInfo
+            from datetime import datetime
+            
+            channel_name_final = channel_name or f"Channel_{channel_id}"
+            
+            new_channel_info = ChannelInfo(
+                channel_id=channel_id,
+                channel_name=channel_name_final,
+                http_accessible=True,  # Will be verified below
+                websocket_accessible=False,
+                last_checked=datetime.now()
+            )
+            
+            # Test channel accessibility through Discord API
+            channel_accessible = False
+            real_channel_name = channel_name_final
+            
+            if hasattr(self.discord_service, 'sessions') and self.discord_service.sessions:
+                try:
+                    import asyncio
+                    
+                    async def test_channel_access():
+                        try:
+                            session = self.discord_service.sessions[0]
+                            
+                            # Use rate limiter if available
+                            if hasattr(self.discord_service, 'rate_limiter'):
+                                await self.discord_service.rate_limiter.wait_if_needed(f"test_channel_{channel_id}")
+                            
+                            # Get channel info
+                            async with session.get(f'https://discord.com/api/v9/channels/{channel_id}') as response:
+                                if response.status == 200:
+                                    channel_data = await response.json()
+                                    name = channel_data.get('name', channel_name_final)
+                                    
+                                    # Test message access
+                                    async with session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1') as msg_response:
+                                        accessible = msg_response.status == 200
+                                        return accessible, name
+                                return False, channel_name_final
+                        except Exception as e:
+                            self.logger.error(f"Error testing channel access: {e}")
+                            return False, channel_name_final
+                    
+                    # Create a new event loop
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        channel_accessible, real_channel_name = loop.run_until_complete(test_channel_access())
+                    finally:
+                        loop.close()
+                    
+                    # Update channel info with results
+                    new_channel_info.http_accessible = channel_accessible
+                    new_channel_info.channel_name = real_channel_name
+                    channel_name_final = real_channel_name
+                    
+                except Exception as e:
+                    self.logger.error(f"Error testing channel: {e}")
+            
+            # Add channel to server info
+            server_info.channels[channel_id] = new_channel_info
+            
+            # Update accessible channels if needed
+            if hasattr(server_info, 'accessible_channels') and channel_accessible:
+                server_info.accessible_channels[channel_id] = new_channel_info
+            
+            # Add to monitored channels
+            is_announcement = self._is_announcement_channel(channel_name_final)
+            
+            if hasattr(self.discord_service, 'monitored_announcement_channels'):
+                self.discord_service.monitored_announcement_channels.add(channel_id)
+                self.logger.info(f"Added channel '{channel_name_final}' ({channel_id}) to monitoring")
+            
+            # Update server statistics
+            server_info.update_stats()
+            
+            # Success message
+            if channel_accessible:
+                access_msg = "✅ Channel is accessible"
+            else:
+                access_msg = "⚠️ Channel may not be accessible"
+                
+            success_message = (
+                f"Channel successfully added and will be monitored!\n"
+                f"{access_msg}\n"
+                f"Server now has {len(server_info.channels)} channels.\n\n"
+            )
+            
+            if is_announcement:
+                success_message += "📢 This is an ANNOUNCEMENT channel"
+            else:
+                success_message += "📝 This is a regular channel"
+            
+            # Notify Discord service if necessary
+            if hasattr(self.discord_service, 'notify_new_channel_added'):
+                try:
+                    self.discord_service.notify_new_channel_added(server_name, channel_id, channel_name_final)
+                except Exception as e:
+                    self.logger.warning(f"Could not notify Discord service: {e}")
+            
+            return True, success_message
+            
+        except Exception as e:
+            self.logger.error(f"Error adding channel to server: {e}")
+            return False, f"Error adding channel: {str(e)}"
+    
+    def remove_channel_from_server(self, server_name: str, channel_id: str) -> tuple[bool, str]:
+        """Удалить канал из мониторинга сервера"""
+        try:
+            self.logger.info(f"Removing channel from monitoring: server={server_name}, channel_id={channel_id}")
+            
+            # Проверяем что Discord service доступен
+            if not self.discord_service:
+                return False, "Discord service not available"
+            
+            servers = getattr(self.discord_service, 'servers', {})
+            if server_name not in servers:
+                return False, f"Server '{server_name}' not found"
+            
+            server_info = servers[server_name]
+            
+            # Проверяем что канал существует в сервере
+            if channel_id not in server_info.channels:
+                return False, f"Channel {channel_id} not found in server {server_name}"
+            
+            # Проверяем что канал действительно мониторится
+            if not hasattr(self.discord_service, 'monitored_announcement_channels'):
+                return False, "Monitored channels list not available"
+            
+            if channel_id not in self.discord_service.monitored_announcement_channels:
+                return False, "Channel is not being monitored"
+            
+            # Получаем информацию о канале перед удалением
+            channel_info = server_info.channels[channel_id]
+            channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
+            is_announcement = self._is_announcement_channel(channel_name)
+            
+            # Удаляем канал из мониторинга
+            self.discord_service.monitored_announcement_channels.remove(channel_id)
+            
+            # Уведомляем Discord service об удалении
+            if hasattr(self.discord_service, 'notify_channel_removed'):
+                try:
+                    self.discord_service.notify_channel_removed(server_name, channel_id, channel_name)
+                except Exception as e:
+                    self.logger.warning(f"Could not notify Discord service about removal: {e}")
+            
+            # Обновляем статистику сервера
+            server_info.update_stats()
+            
+            # Подсчитываем оставшиеся мониторимые каналы
+            remaining_monitored = len([
+                ch_id for ch_id in server_info.channels.keys() 
+                if ch_id in self.discord_service.monitored_announcement_channels
+            ])
+            
+            # Формируем сообщение об успехе
+            channel_type = "announcement" if is_announcement else "regular"
+            success_message = (
+                f"Channel '{channel_name}' removed from monitoring!\n"
+                f"• Type: {channel_type.title()}\n"
+                f"• Remaining monitored channels: {remaining_monitored}\n"
+                f"• Channel still exists in Discord\n"
+                f"• Messages will no longer be forwarded"
+            )
+            
+            self.logger.info(f"✅ Channel '{channel_name}' ({channel_id}) removed from monitoring")
+            self.logger.info(f"📊 Server '{server_name}' now has {remaining_monitored} monitored channels")
+            
+            # Логируем изменения в мониторинге
+            announcement_channels = len([
+                ch for ch in server_info.channels.values() 
+                if ch.channel_id in self.discord_service.monitored_announcement_channels
+                and self._is_announcement_channel(ch.channel_name)
+            ])
+            manual_channels = remaining_monitored - announcement_channels
+            
+            self.logger.info(f"📈 Monitoring breakdown:")
+            self.logger.info(f"   • Auto-discovered announcement: {announcement_channels}")
+            self.logger.info(f"   • Manually added regular: {manual_channels}")
+            self.logger.info(f"   • Total monitored: {remaining_monitored}")
+            
+            return True, success_message
+            
+        except ValueError as e:
+            # Канал не был в списке мониторинга
+            self.logger.warning(f"Channel {channel_id} was not in monitoring list: {e}")
+            return False, "Channel was not in monitoring list"
+        except Exception as e:
+            self.logger.error(f"Error removing channel from monitoring: {e}")
+            return False, f"Error removing channel: {str(e)}"
+
+    def _handle_channel_stats(self, call):
+        """Обработчик статистики каналов"""
+        try:
+            server_name = call.data.replace('channel_stats_', '', 1)
+            
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
+            
+            # Собираем статистику
+            total_channels = len(server_info.channels)
+            accessible_channels = len(channels)
+            monitored_channels = 0
+            announcement_channels = 0
+            regular_channels = 0
+            total_messages = 0
+            
+            for channel_id, channel_info in channels.items():
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    monitored_channels += 1
+                    total_messages += getattr(channel_info, 'message_count', 0)
+                    
+                    if self._is_announcement_channel(channel_info.channel_name):
+                        announcement_channels += 1
+                    else:
+                        regular_channels += 1
+            
+            # Topic информация
+            topic_id = self.server_topics.get(server_name)
+            topic_status = "❌ No topic"
+            
+            if topic_id:
+                try:
+                    topic_info = self.bot.get_forum_topic(call.message.chat.id, topic_id)
+                    topic_status = f"✅ Topic {topic_id}" if topic_info else f"❌ Invalid topic {topic_id}"
+                except:
+                    topic_status = f"❌ Invalid topic {topic_id}"
+            
+            text = (
+                f"📊 **Channel Statistics - {server_name}**\n\n"
+                f"**📋 Channel Overview:**\n"
+                f"• Total channels: {total_channels}\n"
+                f"• Accessible channels: {accessible_channels}\n"
+                f"• Monitored channels: {monitored_channels}\n\n"
+                f"**🔔 Monitoring Breakdown:**\n"
+                f"• 📢 Announcement: {announcement_channels}\n"
+                f"• 📝 Regular (manual): {regular_channels}\n"
+                f"• 🚫 Not monitored: {accessible_channels - monitored_channels}\n\n"
+                f"**📈 Activity Stats:**\n"
+                f"• Total messages tracked: {total_messages}\n"
+                f"• Average per channel: {total_messages / max(monitored_channels, 1):.1f}\n\n"
+                f"**🎯 Telegram Integration:**\n"
+                f"• {topic_status}\n"
+                f"• All monitored channels → Same topic\n"
+                f"• Real-time forwarding: ✅ Active\n\n"
+                f"**💡 Management:**\n"
+                f"• Strategy: Auto announcement + Manual any\n"
+                f"• All monitored channels are removable\n"
+                f"• Channels can be added via bot interface"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🔄 Refresh Stats", callback_data=f"channel_stats_{server_name}"),
+                InlineKeyboardButton("📋 Manage", callback_data=f"manage_channels_{server_name}")
+            )
+            markup.add(InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"))
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in channel stats: {e}")
+
+    def _handle_show_all_removable(self, call):
+        """Показать все каналы доступные для удаления (если их больше 10)"""
+        try:
+            server_name = call.data.replace('show_all_remove_', '', 1)
+            
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
+            
+            # Получаем все мониторимые каналы
+            monitored_channels = {}
+            for channel_id, channel_info in channels.items():
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    monitored_channels[channel_id] = channel_info
+            
+            if not monitored_channels:
+                self.bot.answer_callback_query(call.id, "❌ No monitored channels")
+                return
+            
+            # Создаем текстовый список всех каналов
+            text = (
+                f"🗑️ **All Removable Channels - {server_name}**\n\n"
+                f"📊 **{len(monitored_channels)} monitored channels:**\n\n"
+            )
+            
+            # Группируем каналы по типу
+            announcement_channels = []
+            regular_channels = []
+            
+            for channel_id, channel_info in monitored_channels.items():
+                channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
+                if self._is_announcement_channel(channel_name):
+                    announcement_channels.append((channel_id, channel_name))
+                else:
+                    regular_channels.append((channel_id, channel_name))
+            
+            if announcement_channels:
+                text += f"📢 **Announcement Channels ({len(announcement_channels)}):**\n"
+                for channel_id, channel_name in announcement_channels:
+                    text += f"• {channel_name} (`{channel_id}`)\n"
+                text += "\n"
+            
+            if regular_channels:
+                text += f"📝 **Regular Channels ({len(regular_channels)}):**\n"
+                for channel_id, channel_name in regular_channels:
+                    text += f"• {channel_name} (`{channel_id}`)\n"
+                text += "\n"
+            
+            text += (
+                f"💡 **To remove a channel:**\n"
+                f"1. Use 'Remove Channel' button\n"
+                f"2. Select channel from the list\n"
+                f"3. Confirm removal\n\n"
+                f"⚠️ **Note:** Removal stops monitoring, doesn't delete from Discord"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("🗑️ Remove Channel", callback_data=f"remove_channel_{server_name}"),
+                InlineKeyboardButton("📋 Manage All", callback_data=f"manage_channels_{server_name}")
+            )
+            markup.add(InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"))
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error showing all removable channels: {e}")
+
+    def get_channel_management_summary(self, server_name: str) -> Dict:
+        """Получить сводку по управлению каналами для API"""
+        try:
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                return {"error": "Server not found"}
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
+            
+            # Анализируем каналы
+            monitored_channels = []
+            unmonitored_channels = []
+            
+            for channel_id, channel_info in channels.items():
+                channel_data = {
+                    "channel_id": channel_id,
+                    "channel_name": channel_info.channel_name,
+                    "is_announcement": self._is_announcement_channel(channel_info.channel_name),
+                    "accessible": channel_info.http_accessible,
+                    "message_count": getattr(channel_info, 'message_count', 0)
+                }
+                
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    channel_data["monitored"] = True
+                    channel_data["can_remove"] = True
+                    monitored_channels.append(channel_data)
+                else:
+                    channel_data["monitored"] = False
+                    channel_data["can_add"] = True
+                    unmonitored_channels.append(channel_data)
+            
+            # Статистика
+            announcement_monitored = len([ch for ch in monitored_channels if ch["is_announcement"]])
+            regular_monitored = len(monitored_channels) - announcement_monitored
+            
+            return {
+                "server_name": server_name,
+                "telegram_topic_id": self.server_topics.get(server_name),
+                "monitoring_summary": {
+                    "total_channels": len(server_info.channels),
+                    "accessible_channels": len(channels),
+                    "monitored_channels": len(monitored_channels),
+                    "unmonitored_channels": len(unmonitored_channels),
+                    "announcement_monitored": announcement_monitored,
+                    "regular_monitored": regular_monitored
+                },
+                "monitored_channels": monitored_channels,
+                "unmonitored_channels": unmonitored_channels,
+                "management_options": {
+                    "can_add_channels": len(unmonitored_channels) > 0,
+                    "can_remove_channels": len(monitored_channels) > 0,
+                    "max_channels": getattr(server_info, 'max_channels', 5),
+                    "current_usage": len(server_info.channels)
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error getting channel management summary: {e}")
+            return {"error": str(e)}
     def _handle_get_messages(self, call):
         """Handle get messages request with actual message retrieval"""
         try:
@@ -1236,145 +1713,279 @@ class TelegramService:
             self.logger.error(f"Error sending servers list: {e}")
             self.bot.reply_to(message, f"❌ Error: {str(e)}")
     
-    def add_channel_to_server(self, server_name: str, channel_id: str, channel_name: str = None) -> tuple[bool, str]:
-        """Add any channel to a server and enable monitoring"""
+    def _handle_remove_channel_request(self, call):
+        """Обработчик запроса на удаление канала"""
         try:
-            self.logger.info(f"Adding channel to server: {server_name}, channel_id: {channel_id}, name: {channel_name}")
+            server_name = call.data.replace('remove_channel_', '', 1)
             
-            # Check if Discord service is available
-            if not self.discord_service:
-                return False, "Discord service not available"
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
             
-            servers = getattr(self.discord_service, 'servers', {})
-            if server_name not in servers:
-                return False, f"Server '{server_name}' not found in Discord service"
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
             
-            server_info = servers[server_name]
+            # Получаем только мониторимые каналы
+            monitored_channels = {}
+            for channel_id, channel_info in channels.items():
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    monitored_channels[channel_id] = channel_info
             
-            # Check limits
-            current_channel_count = len(server_info.channels)
-            max_channels = getattr(server_info, 'max_channels', 5)
+            if not monitored_channels:
+                self.bot.answer_callback_query(call.id, "❌ No monitored channels to remove")
+                return
             
-            if current_channel_count >= max_channels:
-                return False, f"Server has reached maximum channels limit ({max_channels})"
-            
-            # Check if channel is already added
-            if channel_id in server_info.channels:
-                # If already added, just ensure it's monitored
-                if hasattr(self.discord_service, 'monitored_announcement_channels'):
-                    self.discord_service.monitored_announcement_channels.add(channel_id)
-                    self.logger.info(f"Channel {channel_id} already exists - ensuring it's monitored")
-                    return True, "Channel is already added and will be monitored"
-                return False, "Channel is already added to this server"
-            
-            # Create channel_info
-            from ..models.server import ChannelInfo
-            from datetime import datetime
-            
-            channel_name_final = channel_name or f"Channel_{channel_id}"
-            
-            new_channel_info = ChannelInfo(
-                channel_id=channel_id,
-                channel_name=channel_name_final,
-                http_accessible=True,  # Will be verified below
-                websocket_accessible=False,
-                last_checked=datetime.now()
+            text = (
+                f"🗑️ **Remove Channel from {server_name}**\n\n"
+                f"Select a channel to remove from monitoring:\n\n"
+                f"⚠️ **Warning:** Removed channels will no longer forward messages to Telegram.\n"
             )
             
-            # Test channel accessibility through Discord API
-            channel_accessible = False
-            real_channel_name = channel_name_final
+            markup = InlineKeyboardMarkup()
             
-            if hasattr(self.discord_service, 'sessions') and self.discord_service.sessions:
-                try:
-                    import asyncio
-                    
-                    async def test_channel_access():
-                        try:
-                            session = self.discord_service.sessions[0]
-                            
-                            # Use rate limiter if available
-                            if hasattr(self.discord_service, 'rate_limiter'):
-                                await self.discord_service.rate_limiter.wait_if_needed(f"test_channel_{channel_id}")
-                            
-                            # Get channel info
-                            async with session.get(f'https://discord.com/api/v9/channels/{channel_id}') as response:
-                                if response.status == 200:
-                                    channel_data = await response.json()
-                                    name = channel_data.get('name', channel_name_final)
-                                    
-                                    # Test message access
-                                    async with session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1') as msg_response:
-                                        accessible = msg_response.status == 200
-                                        return accessible, name
-                                return False, channel_name_final
-                        except Exception as e:
-                            self.logger.error(f"Error testing channel access: {e}")
-                            return False, channel_name_final
-                    
-                    # Create a new event loop
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    
-                    try:
-                        channel_accessible, real_channel_name = loop.run_until_complete(test_channel_access())
-                    finally:
-                        loop.close()
-                    
-                    # Update channel info with results
-                    new_channel_info.http_accessible = channel_accessible
-                    new_channel_info.channel_name = real_channel_name
-                    channel_name_final = real_channel_name
-                    
-                except Exception as e:
-                    self.logger.error(f"Error testing channel: {e}")
-            
-            # Add channel to server info
-            server_info.channels[channel_id] = new_channel_info
-            
-            # Update accessible channels if needed
-            if hasattr(server_info, 'accessible_channels') and channel_accessible:
-                server_info.accessible_channels[channel_id] = new_channel_info
-            
-            # Add to monitored channels
-            is_announcement = self._is_announcement_channel(channel_name_final)
-            
-            if hasattr(self.discord_service, 'monitored_announcement_channels'):
-                self.discord_service.monitored_announcement_channels.add(channel_id)
-                self.logger.info(f"Added channel '{channel_name_final}' ({channel_id}) to monitoring")
-            
-            # Update server statistics
-            server_info.update_stats()
-            
-            # Success message
-            if channel_accessible:
-                access_msg = "✅ Channel is accessible"
-            else:
-                access_msg = "⚠️ Channel may not be accessible"
+            # Показываем кнопки для каждого мониторимого канала
+            for channel_id, channel_info in list(monitored_channels.items())[:10]:  # Limit to 10
+                channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
                 
-            success_message = (
-                f"Channel successfully added and will be monitored!\n"
-                f"{access_msg}\n"
-                f"Server now has {len(server_info.channels)} channels.\n\n"
+                # Определяем тип канала
+                if self._is_announcement_channel(channel_name):
+                    channel_type_emoji = "📢"
+                    channel_type = "announcement"
+                else:
+                    channel_type_emoji = "📝"
+                    channel_type = "regular"
+                
+                # Укорачиваем название для кнопки
+                display_name = channel_name[:25] + "..." if len(channel_name) > 25 else channel_name
+                
+                markup.add(
+                    InlineKeyboardButton(
+                        f"{channel_type_emoji} {display_name}",
+                        callback_data=f"confirm_remove_{server_name}_{channel_id}"
+                    )
+                )
+            
+            if len(monitored_channels) > 10:
+                markup.add(
+                    InlineKeyboardButton(
+                        f"📄 Show all ({len(monitored_channels)} total)",
+                        callback_data=f"show_all_remove_{server_name}"
+                    )
+                )
+            
+            markup.add(InlineKeyboardButton("❌ Cancel", callback_data=f"server_{server_name}"))
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
             )
-            
-            if is_announcement:
-                success_message += "📢 This is an ANNOUNCEMENT channel"
-            else:
-                success_message += "📝 This is a regular channel"
-            
-            # Notify Discord service if necessary
-            if hasattr(self.discord_service, 'notify_new_channel_added'):
-                try:
-                    self.discord_service.notify_new_channel_added(server_name, channel_id, channel_name_final)
-                except Exception as e:
-                    self.logger.warning(f"Could not notify Discord service: {e}")
-            
-            return True, success_message
             
         except Exception as e:
-            self.logger.error(f"Error adding channel to server: {e}")
-            return False, f"Error adding channel: {str(e)}"
+            self.logger.error(f"Error in remove channel request: {e}")
+
+    def _handle_confirm_remove_channel(self, call):
+        """Обработчик подтверждения удаления канала"""
+        try:
+            # Парсим callback data: confirm_remove_{server_name}_{channel_id}
+            parts = call.data.replace('confirm_remove_', '', 1).split('_', 1)
+            if len(parts) != 2:
+                self.bot.answer_callback_query(call.id, "❌ Invalid data format")
+                return
+            
+            server_name, channel_id = parts
+            
+            self.logger.info(f"Confirming channel removal: server={server_name}, channel_id={channel_id}")
+            
+            # Получаем информацию о канале перед удалением
+            channel_name = f"Channel_{channel_id}"
+            channel_type = "unknown"
+            
+            if self.discord_service and server_name in getattr(self.discord_service, 'servers', {}):
+                server_info = self.discord_service.servers[server_name]
+                if channel_id in server_info.channels:
+                    channel_info = server_info.channels[channel_id]
+                    channel_name = getattr(channel_info, 'channel_name', channel_name)
+                    channel_type = "announcement" if self._is_announcement_channel(channel_name) else "regular"
+            
+            # Показываем финальное подтверждение
+            text = (
+                f"🗑️ **Confirm Channel Removal**\n\n"
+                f"**Server:** {server_name}\n"
+                f"**Channel:** {channel_name}\n"
+                f"**Type:** {channel_type.title()}\n"
+                f"**Channel ID:** `{channel_id}`\n\n"
+                f"⚠️ **This will:**\n"
+                f"• Stop monitoring this channel\n"
+                f"• Remove it from message forwarding\n"
+                f"• Channel will remain in Discord (not deleted)\n\n"
+                f"❓ **Are you sure you want to remove this channel from monitoring?**"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("✅ Yes, Remove", callback_data=f"final_remove_{server_name}_{channel_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"remove_channel_{server_name}")
+            )
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error confirming remove channel: {e}")
+
+    def _handle_final_remove_channel(self, call):
+        """Обработчик финального удаления канала"""
+        try:
+            # Парсим callback data: final_remove_{server_name}_{channel_id}
+            parts = call.data.replace('final_remove_', '', 1).split('_', 1)
+            if len(parts) != 2:
+                self.bot.answer_callback_query(call.id, "❌ Invalid data format")
+                return
+            
+            server_name, channel_id = parts
+            
+            self.logger.info(f"Final channel removal: server={server_name}, channel_id={channel_id}")
+            
+            # Выполняем удаление
+            success, message = self.remove_channel_from_server(server_name, channel_id)
+            
+            markup = InlineKeyboardMarkup()
+            if success:
+                markup.add(
+                    InlineKeyboardButton("📋 View Server", callback_data=f"server_{server_name}"),
+                    InlineKeyboardButton("🔙 Back to Servers", callback_data="servers")
+                )
+                status_icon = "✅"
+                result_text = "**Channel Removal Successful**"
+            else:
+                markup.add(InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"))
+                status_icon = "❌"
+                result_text = "**Channel Removal Failed**"
+            
+            # Получаем обновленную информацию о канале
+            channel_name = f"Channel_{channel_id}"
+            if self.discord_service and server_name in getattr(self.discord_service, 'servers', {}):
+                server_info = self.discord_service.servers[server_name]
+                if channel_id in server_info.channels:
+                    channel_info = server_info.channels[channel_id]
+                    channel_name = getattr(channel_info, 'channel_name', channel_name)
+            
+            self.bot.edit_message_text(
+                f"{status_icon} {result_text}\n\n"
+                f"**Server:** {server_name}\n"
+                f"**Channel:** {channel_name}\n"
+                f"**Channel ID:** `{channel_id}`\n\n"
+                f"**Result:** {message}",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in final remove channel: {e}")
+            try:
+                self.bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 Back", callback_data="start"))
+                self.bot.edit_message_text(
+                    f"❌ Error removing channel: {str(e)}",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+            except Exception as inner_e:
+                self.logger.error(f"Error in error handling: {inner_e}")
+
+    def _handle_manage_channels(self, call):
+        """Обработчик управления каналами (детальный список)"""
+        try:
+            server_name = call.data.replace('manage_channels_', '', 1)
+            
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'accessible_channels', {})
+            
+            # Получаем мониторимые каналы с детальной информацией
+            monitored_channels = []
+            for channel_id, channel_info in channels.items():
+                if channel_id in self.discord_service.monitored_announcement_channels:
+                    is_announcement = self._is_announcement_channel(channel_info.channel_name)
+                    monitored_channels.append({
+                        'id': channel_id,
+                        'name': channel_info.channel_name,
+                        'type': 'announcement' if is_announcement else 'regular',
+                        'accessible': channel_info.http_accessible,
+                        'message_count': getattr(channel_info, 'message_count', 0),
+                        'last_message': getattr(channel_info, 'last_message_time', None)
+                    })
+            
+            if not monitored_channels:
+                self.bot.answer_callback_query(call.id, "❌ No monitored channels")
+                return
+            
+            text = (
+                f"📋 **Channel Management - {server_name}**\n\n"
+                f"🔔 **Monitored Channels ({len(monitored_channels)}):**\n\n"
+            )
+            
+            # Показываем детальную информацию о каналах
+            for i, channel in enumerate(monitored_channels[:8], 1):
+                type_emoji = "📢" if channel['type'] == 'announcement' else "📝"
+                access_emoji = "✅" if channel['accessible'] else "❌"
+                
+                text += f"{i}. {type_emoji} **{channel['name']}**\n"
+                text += f"   🆔 `{channel['id']}`\n"
+                text += f"   🔗 Access: {access_emoji}\n"
+                text += f"   📊 Messages: {channel['message_count']}\n"
+                
+                if channel['last_message']:
+                    last_msg_time = channel['last_message'].strftime('%Y-%m-%d %H:%M')
+                    text += f"   📅 Last: {last_msg_time}\n"
+                
+                text += "\n"
+            
+            if len(monitored_channels) > 8:
+                text += f"... and {len(monitored_channels) - 8} more channels\n\n"
+            
+            text += (
+                f"💡 **Actions:**\n"
+                f"• All channels forward to the same topic\n"
+                f"• Use buttons below to add/remove channels"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            markup.add(
+                InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}"),
+                InlineKeyboardButton("🗑️ Remove Channel", callback_data=f"remove_channel_{server_name}")
+            )
+            markup.add(
+                InlineKeyboardButton("📥 Get Messages", callback_data=f"get_messages_{server_name}"),
+                InlineKeyboardButton("📊 Channel Stats", callback_data=f"channel_stats_{server_name}")
+            )
+            markup.add(InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"))
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in manage channels: {e}")
 
 
     
