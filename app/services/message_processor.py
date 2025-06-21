@@ -1,8 +1,8 @@
-# app/services/message_processor.py - ИСПРАВЛЕННАЯ ВЕРСИЯ без дублирования
+
 import asyncio
 import hashlib
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Set
 import structlog
 
@@ -558,9 +558,15 @@ class MessageProcessor:
                 
                 last_processed = self.last_processed_message_per_channel.get(channel_id)
                 
+                # Ensure timezone-aware comparison
+                from ..models.message import normalize_datetime
+                aware_cutoff = normalize_datetime(cutoff_time)
+                if last_processed:
+                    last_processed = normalize_datetime(last_processed)
+                
                 for msg in messages:
                     # Only if message is newer than cutoff AND newer than last processed
-                    if (msg.timestamp > cutoff_time and 
+                    if (msg.timestamp > aware_cutoff and 
                         (not last_processed or msg.timestamp > last_processed)):
                         
                         msg_hash = self._create_message_hash(msg)
@@ -572,12 +578,12 @@ class MessageProcessor:
                                 self.processed_message_hashes.add(msg_hash)
                                 # Update last processed time
                                 self.last_processed_message_per_channel[channel_id] = msg.timestamp
-                
+            
             except Exception as e:
-                self.logger.error("Error in missed messages check",
-                                server=server_name,
-                                channel_id=channel_id,
-                                error=str(e))
+                        self.logger.error("Error in missed messages check",
+                                        server=server_name,
+                                        channel_id=channel_id,
+                                        error=str(e))
         
         if missed_messages:
             # Sort and send

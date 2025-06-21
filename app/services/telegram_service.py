@@ -514,7 +514,7 @@ class TelegramService:
     
     # Handler methods for bot interface (ИСПРАВЛЕНИЯ)
     def _handle_servers_list(self, call):
-        """Enhanced server list handler with pagination"""
+        """ОБНОВЛЕНО: Список серверов с полной пагинацией"""
         try:
             # Get page number from call attribute or callback data
             page = 0
@@ -551,8 +551,8 @@ class TelegramService:
                 )
                 return
             
-            # Pagination settings
-            servers_per_page = 8
+            # Pagination settings - УВЕЛИЧЕНО для всех серверов
+            servers_per_page = 10  # Увеличено с 8 до 10
             total_servers = len(servers)
             total_pages = (total_servers + servers_per_page - 1) // servers_per_page
             
@@ -591,7 +591,7 @@ class TelegramService:
                     topic_indicator = " 🆕"
                 
                 # Server button with info (truncate long names)
-                display_name = server_name[:25] + "..." if len(server_name) > 25 else server_name
+                display_name = server_name[:22] + "..." if len(server_name) > 22 else server_name
                 button_text = f"{display_name}{topic_indicator}"
                 if monitored_channels > 0:
                     button_text += f" ({monitored_channels}📢)"
@@ -601,14 +601,20 @@ class TelegramService:
                     callback_data=f"server_{server_name}"
                 ))
             
-            # Pagination controls (only if needed)
+            # УЛУЧШЕННЫЕ pagination controls
             if total_pages > 1:
                 pagination_buttons = []
+                
+                # First page button (если не на первой странице)
+                if page > 1:
+                    pagination_buttons.append(
+                        InlineKeyboardButton("⏪ First", callback_data="servers_page_0")
+                    )
                 
                 # Previous page button
                 if page > 0:
                     pagination_buttons.append(
-                        InlineKeyboardButton("⬅️ Prev", callback_data=f"servers_page_{page-1}")
+                        InlineKeyboardButton("◀️ Prev", callback_data=f"servers_page_{page-1}")
                     )
                 
                 # Page indicator
@@ -619,11 +625,22 @@ class TelegramService:
                 # Next page button
                 if page < total_pages - 1:
                     pagination_buttons.append(
-                        InlineKeyboardButton("Next ➡️", callback_data=f"servers_page_{page+1}")
+                        InlineKeyboardButton("▶️ Next", callback_data=f"servers_page_{page+1}")
                     )
                 
-                # Add pagination row
-                markup.row(*pagination_buttons)
+                # Last page button (если не на последней странице)
+                if page < total_pages - 2:
+                    pagination_buttons.append(
+                        InlineKeyboardButton("⏭️ Last", callback_data=f"servers_page_{total_pages-1}")
+                    )
+                
+                # Add pagination row(s)
+                if len(pagination_buttons) <= 3:
+                    markup.row(*pagination_buttons)
+                else:
+                    # Split into two rows if too many buttons
+                    markup.row(*pagination_buttons[:3])
+                    markup.row(*pagination_buttons[3:])
             
             # Additional action buttons
             markup.add(InlineKeyboardButton("🔄 Refresh", callback_data="servers"))
@@ -635,16 +652,13 @@ class TelegramService:
             # Count total monitored channels
             total_monitored = 0
             total_announcement = 0
-            total_manual = 0
             
             for server_info in servers.values():
                 for channel_id, channel_info in server_info.channels.items():
                     if channel_id in self.discord_service.monitored_announcement_channels:
                         total_monitored += 1
-                        if self._is_announcement_channel(channel_info.channel_name):
-                            total_announcement += 1
-                        else:
-                            total_manual += 1
+                        # В текущей логике все мониторимые каналы - announcement
+                        total_announcement += 1
             
             text = (
                 f"📋 **Server Management**"
@@ -657,9 +671,8 @@ class TelegramService:
                 f"\n\n📊 **Overview:**\n"
                 f"• Total servers: {total_servers}\n"
                 f"• Topics created: {topic_count}\n"
-                f"• Monitored channels: {total_monitored}\n"
-                f"  └ 📢 Announcement: {total_announcement}\n"
-                f"  └ 📝 Manual: {total_manual}\n\n"
+                f"• Auto-found announcement channels: {total_announcement}\n"
+                f"• Strategy: Auto announcement discovery\n\n"
                 f"🛡️ Anti-duplicate: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
             )
             
@@ -670,8 +683,11 @@ class TelegramService:
             
             text += (
                 f"📋 = Has topic, ❌ = Invalid topic, 🆕 = No topic\n"
-                f"(Number) = Monitored channels\n\n"
-                f"Select a server to manage:"
+                f"(Number) = Announcement channels\n\n"
+                f"💡 **Select a server to:**\n"
+                f"• View announcement channels\n"
+                f"• Browse ALL available channels\n"
+                f"• Add channels manually"
             )
             
             self.bot.edit_message_text(
@@ -978,7 +994,7 @@ class TelegramService:
             self.logger.error(f"Error in verify topics: {e}")
     
     def _handle_server_selected(self, call):
-        """ОБНОВЛЕННЫЙ: Handle server selection с кнопкой управления каналами"""
+        """ОБНОВЛЕНО: Показ сервера с announcement + кнопка для всех каналов"""
         try:
             server_name = call.data.replace('server_', '', 1)
             
@@ -987,20 +1003,12 @@ class TelegramService:
                 return
 
             server_info = self.discord_service.servers[server_name]
-            channels = getattr(server_info, 'accessible_channels', {})
             
-            # Подсчет мониторимых каналов
-            monitored_channels = {}
-            announcement_count = 0
-            regular_count = 0
-            
-            for channel_id, channel_info in channels.items():
+            # Подсчет announcement каналов (автоматически найденных)
+            announcement_channels = {}
+            for channel_id, channel_info in server_info.channels.items():
                 if channel_id in self.discord_service.monitored_announcement_channels:
-                    monitored_channels[channel_id] = channel_info
-                    if self._is_announcement_channel(channel_info.channel_name):
-                        announcement_count += 1
-                    else:
-                        regular_count += 1
+                    announcement_channels[channel_id] = channel_info
             
             # Topic information
             topic_info = ""
@@ -1015,45 +1023,50 @@ class TelegramService:
                 except:
                     topic_info = f"📋 Topic: {existing_topic_id} ❌ (invalid)"
             else:
-                topic_info = "📋 Topic: Not created yet"
+                topic_info = "📋 Topic: Will be created when needed"
             
             text = (
                 f"**{server_name}**\n\n"
-                f"📊 Total channels: {len(channels)}\n"
-                f"🔔 Monitored channels: {len(monitored_channels)}\n"
-                f"📢 Announcement: {announcement_count}\n"
-                f"📝 Regular: {regular_count}\n"
+                f"📊 **Auto-discovered:**\n"
+                f"🔔 Announcement channels: {len(announcement_channels)}\n"
                 f"{topic_info}\n\n"
-                f"📋 **Monitored Channels:**\n"
             )
             
-            # Show monitored channels
-            if monitored_channels:
-                for channel_id, channel_info in list(monitored_channels.items())[:8]:  # Show max 8
+            # Show announcement channels
+            if announcement_channels:
+                text += f"📢 **Active Announcement Channels:**\n"
+                for channel_id, channel_info in list(announcement_channels.items())[:5]:  # Show max 5
                     channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
-                    channel_type = "📢" if self._is_announcement_channel(channel_name) else "📝"
-                    text += f"• {channel_type} {channel_name}\n"
+                    text += f"• {channel_name}\n"
                 
-                if len(monitored_channels) > 8:
-                    text += f"• ... and {len(monitored_channels) - 8} more\n"
+                if len(announcement_channels) > 5:
+                    text += f"• ... and {len(announcement_channels) - 5} more\n"
             else:
-                text += "• No channels being monitored\n"
+                text += f"📭 **No announcement channels found**\n"
+            
+            text += (
+                f"\n💡 **Available Actions:**\n"
+                f"• View recent messages from announcement channels\n"
+                f"• Browse ALL server channels by category\n"
+                f"• Add any channel manually to monitoring"
+            )
             
             markup = InlineKeyboardMarkup()
             
             # Action buttons
-            if monitored_channels:
+            if announcement_channels:
                 markup.add(
-                    InlineKeyboardButton("📥 Get Messages", callback_data=f"get_messages_{server_name}"),
-                    InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
+                    InlineKeyboardButton("📥 Get Messages", callback_data=f"get_messages_{server_name}")
                 )
+            
+            # НОВАЯ КНОПКА: Показать все каналы по категориям
+            markup.add(
+                InlineKeyboardButton("📋 Browse All Channels", callback_data=f"browse_channels_{server_name}")
+            )
+            
+            if announcement_channels:
                 markup.add(
-                    InlineKeyboardButton("🗑️ Remove Channel", callback_data=f"remove_channel_{server_name}"),
-                    InlineKeyboardButton("📋 Manage Channels", callback_data=f"manage_channels_{server_name}")
-                )
-            else:
-                markup.add(
-                    InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
+                    InlineKeyboardButton("📊 Channel Stats", callback_data=f"channel_stats_{server_name}")
                 )
             
             markup.add(InlineKeyboardButton("🔙 Back to Servers", callback_data="servers"))
