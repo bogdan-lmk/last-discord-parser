@@ -220,58 +220,69 @@ class DiscordService:
         return False
     
     async def _discover_announcement_channels_only(self) -> None:
-        """Discover announcement channels"""
+        """Discover announcement channels from ALL available servers"""
         if not self.sessions:
             return
         
-        self.logger.info("🔍 Discovering ANNOUNCEMENT channels only...")
+        self.logger.info("🔍 Discovering ANNOUNCEMENT channels from ALL servers...")
         
-        for attempt in range(self.max_retries):
+        # Получаем ВСЕ гильдии со всех токенов
+        all_guilds = await self._fetch_all_guilds_from_all_tokens()
+        
+        if not all_guilds:
+            self.logger.error("No guilds found from any token")
+            return
+        
+        self.logger.info(f"📊 Found {len(all_guilds)} total servers across all tokens")
+        
+        # Применяем лимит серверов, но берем максимум доступного
+        actual_max_servers = min(len(all_guilds), self.settings.max_servers)
+        guilds_to_process = all_guilds[:actual_max_servers]
+        
+        self.logger.info(f"🎯 Processing {len(guilds_to_process)} servers (max_servers: {self.settings.max_servers})")
+        
+        # Обрабатываем серверы батчами для лучшей производительности
+        batch_size = self.settings.server_discovery_batch_size
+        total_batches = (len(guilds_to_process) + batch_size - 1) // batch_size
+        
+        processed_count = 0
+        
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(guilds_to_process))
+            batch = guilds_to_process[start_idx:end_idx]
+            
+            self.logger.info(f"📦 Processing batch {batch_num + 1}/{total_batches} ({len(batch)} servers)")
+            
+            # Создаем задачи для обработки серверов в батче
+            batch_tasks = []
+            for guild in batch:
+                task = self._process_guild_announcement_channels_safe(guild)
+                batch_tasks.append(task)
+            
+            # Выполняем батч с таймаутом
             try:
-                session = self.sessions[0]
+                batch_results = await asyncio.wait_for(
+                    asyncio.gather(*batch_tasks, return_exceptions=True),
+                    timeout=60  # 60 секунд на батч
+                )
                 
-                await self.rate_limiter.wait_if_needed("discover_guilds")
-                
-                async with session.get('https://discord.com/api/v9/users/@me/guilds') as response:
-                    if response.status == 429:
-                        retry_after = float(response.headers.get('Retry-After', 60))
-                        await asyncio.sleep(min(retry_after, 60))
-                        continue
-                    
-                    if response.status != 200:
-                        if response.status in [401, 403]:
-                            break
+                # Подсчитываем результаты
+                for i, result in enumerate(batch_results):
+                    if isinstance(result, Exception):
+                        guild_name = batch[i].get('name', 'Unknown')
+                        self.logger.error(f"❌ Failed to process server {guild_name}: {result}")
+                    elif result:
+                        processed_count += 1
                         
-                        if attempt < self.max_retries - 1:
-                            await asyncio.sleep(self.base_delay * (2 ** attempt))
-                            continue
-                        break
-                    
-                    guilds = await response.json()
-                    self.logger.info("Discovered guilds", count=len(guilds))
-                    
-                    # Process each guild
-                    for guild in guilds[:self.settings.max_servers]:
-                        try:
-                            await self._process_guild_announcement_channels_only(session, guild)
-                        except Exception as e:
-                            self.logger.error("Failed to process guild", 
-                                            guild_id=guild.get('id'),
-                                            guild_name=guild.get('name'),
-                                            error=str(e))
-                            continue
-                    
-                    return
-                    
-            except Exception as e:
-                self.logger.error("Server discovery error", 
-                                error=str(e),
-                                attempt=attempt + 1)
-                
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(self.base_delay * (2 ** attempt))
+            except asyncio.TimeoutError:
+                self.logger.error(f"❌ Batch {batch_num + 1} timed out")
+            
+            # Пауза между батчами
+            if batch_num < total_batches - 1:
+                await asyncio.sleep(1)
         
-        self.logger.warning("Server discovery completed with some failures")
+        self.logger.info(f"✅ Discovery completed: {processed_count} servers processed, {len(self.servers)} with announcement channels")
     
     async def _process_guild_announcement_channels_only(self, session: aiohttp.ClientSession, guild_data: dict) -> None:
         """Process guild to find announcement channels"""
@@ -362,6 +373,8 @@ class DiscordService:
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(self.base_delay * (2 ** attempt))
     
+    
+    
     def _find_announcement_channels_only(self, channels: List[dict]) -> List[dict]:
         """Find announcement channels"""
         announcement_channels = []
@@ -380,6 +393,113 @@ class DiscordService:
         
         self.logger.info("Total announcement channels found", count=len(announcement_channels))
         return announcement_channels
+    
+    async def _fetch_all_guilds_from_all_tokens(self) -> List[dict]:
+        """Получить ВСЕ гильдии со всех доступных токенов"""
+        all_guilds = []
+        seen_guild_ids = set()
+        
+        self.logger.info(f"🔍 Fetching guilds from {len(self.sessions)} tokens...")
+        
+        # Создаем задачи для всех токенов
+        fetch_tasks = []
+        for i, session in enumerate(self.sessions):
+            task = self._fetch_guilds_from_single_token(session, i)
+            fetch_tasks.append(task)
+        
+        # Выполняем запросы параллельно
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        
+        # Объединяем результаты, убирая дубликаты
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                self.logger.error(f"❌ Token {i} failed to fetch guilds: {result}")
+                continue
+            
+            if not result:
+                self.logger.warning(f"⚠️ Token {i} returned no guilds")
+                continue
+                
+            self.logger.info(f"✅ Token {i}: {len(result)} guilds found")
+            
+            for guild in result:
+                guild_id = guild.get('id')
+                if guild_id and guild_id not in seen_guild_ids:
+                    seen_guild_ids.add(guild_id)
+                    guild['_source_token'] = i  # Помечаем источник
+                    all_guilds.append(guild)
+        
+        self.logger.info(f"📊 Total unique guilds collected: {len(all_guilds)} from {len(self.sessions)} tokens")
+        return all_guilds
+    
+    async def _fetch_guilds_from_single_token(self, session: aiohttp.ClientSession, token_index: int) -> List[dict]:
+        """Получить гильдии с одного токена"""
+        for attempt in range(self.max_retries):
+            try:
+                await self.rate_limiter.wait_if_needed(f"guilds_token_{token_index}")
+                
+                async with session.get('https://discord.com/api/v9/users/@me/guilds') as response:
+                    if response.status == 429:
+                        retry_after = float(response.headers.get('Retry-After', 30))
+                        self.logger.warning(f"⏳ Rate limited on token {token_index}, waiting {retry_after}s")
+                        await asyncio.sleep(min(retry_after, 60))
+                        continue
+                    
+                    if response.status != 200:
+                        if response.status in [401, 403]:
+                            self.logger.error(f"❌ Token {token_index} unauthorized (HTTP {response.status})")
+                            break
+                        
+                        self.logger.warning(f"⚠️ Token {token_index} HTTP {response.status}, attempt {attempt + 1}")
+                        
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(self.base_delay * (2 ** attempt))
+                            continue
+                        break
+                    
+                    guilds = await response.json()
+                    self.logger.info(f"✅ Token {token_index}: {len(guilds)} servers found")
+                    return guilds
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Error fetching guilds from token {token_index}: {e}")
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.base_delay * (2 ** attempt))
+        
+        self.logger.error(f"❌ Failed to fetch guilds from token {token_index} after {self.max_retries} attempts")
+        return []
+    
+    async def _process_guild_announcement_channels_safe(self, guild_data: dict) -> bool:
+        """Безопасная обработка гильдии с защитой от ошибок"""
+        guild_name = guild_data.get('name', 'Unknown')
+        guild_id = guild_data.get('id')
+        source_token = guild_data.get('_source_token', 0)
+        
+        try:
+            # Используем токен, который нашел эту гильдию, или случайный
+            if source_token < len(self.sessions):
+                session = self.sessions[source_token]
+            else:
+                session = self._get_healthy_session()
+            
+            if not session:
+                self.logger.error(f"❌ No healthy session for guild {guild_name}")
+                return False
+            
+            # Применяем таймаут для обработки гильдии
+            timeout = getattr(self.settings, 'channel_test_timeout', 10) * 2
+            
+            return await asyncio.wait_for(
+                self._process_guild_announcement_channels_only(session, guild_data),
+                timeout=timeout
+            )
+            
+        except asyncio.TimeoutError:
+            self.logger.error(f"⏰ Guild {guild_name} processing timed out after {timeout}s")
+            return False
+        except Exception as e:
+            self.logger.error(f"❌ Error processing guild {guild_name}: {e}")
+            return False
     
     async def _test_channel_access_with_retry(self, session: aiohttp.ClientSession, channel_id: str) -> bool:
         """Test channel access with retry logic"""

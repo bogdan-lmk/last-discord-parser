@@ -158,7 +158,7 @@ class TelegramService:
         
         @self.bot.callback_query_handler(func=lambda call: True)
         def handle_callback_query(call):
-            """ОБНОВЛЕННЫЙ: Обработчик callback запросов с функцией удаления каналов"""
+            """ИСПРАВЛЕННЫЙ: Обработчик callback запросов без дублирования"""
             try:
                 data = call.data
                 self.logger.info(f"📞 Callback received: {data} from user {call.from_user.id}")
@@ -172,6 +172,12 @@ class TelegramService:
                 # Route to appropriate handler
                 if data == "servers":
                     self._handle_servers_list(call)
+                elif data.startswith("servers_page_"):
+                    self._handle_servers_pagination(call)
+                elif data == "page_info":
+                    # Just acknowledge page info clicks
+                    self.bot.answer_callback_query(call.id, "📄 Current page information")
+                    return
                 elif data == "refresh":
                     self._handle_manual_sync(call)
                 elif data == "websocket":
@@ -196,7 +202,6 @@ class TelegramService:
                     self._handle_confirm_add_channel(call)
                 elif data.startswith("cancel_add_"):
                     self._handle_cancel_add_channel(call)
-                # НОВЫЕ ОБРАБОТЧИКИ ДЛЯ УДАЛЕНИЯ КАНАЛОВ
                 elif data.startswith("remove_channel_"):
                     self._handle_remove_channel_request(call)
                 elif data.startswith("confirm_remove_"):
@@ -509,8 +514,17 @@ class TelegramService:
     
     # Handler methods for bot interface (ИСПРАВЛЕНИЯ)
     def _handle_servers_list(self, call):
-        """Enhanced server list handler with error handling"""
+        """Enhanced server list handler with pagination"""
         try:
+            # Get page number from call attribute or callback data
+            page = 0
+            if hasattr(call, '_page'):
+                page = call._page
+            elif '_page_' in call.data:
+                parts = call.data.split('_page_')
+                if len(parts) == 2 and parts[1].isdigit():
+                    page = int(parts[1])
+            
             # Check if we have Discord service
             if not self.discord_service:
                 markup = InlineKeyboardMarkup()
@@ -523,7 +537,7 @@ class TelegramService:
                 )
                 return
             
-            # ИСПРАВЛЕНИЕ: Получаем серверы из discord_service
+            # Get all servers
             servers = getattr(self.discord_service, 'servers', {})
             
             if not servers:
@@ -537,9 +551,31 @@ class TelegramService:
                 )
                 return
             
+            # Pagination settings
+            servers_per_page = 8
+            total_servers = len(servers)
+            total_pages = (total_servers + servers_per_page - 1) // servers_per_page
+            
+            # Ensure page is within valid range
+            page = max(0, min(page, total_pages - 1))
+            
+            # Get servers for current page
+            server_names = list(servers.keys())
+            start_idx = page * servers_per_page
+            end_idx = min(start_idx + servers_per_page, total_servers)
+            page_servers = server_names[start_idx:end_idx]
+            
+            # Create server buttons for current page
             markup = InlineKeyboardMarkup()
-            for server_name in list(servers.keys())[:10]:  # Limit to first 10 servers
-                # Add topic indicator
+            
+            for server_name in page_servers:
+                # Get server info and topic indicator
+                server_info = servers[server_name]
+                monitored_channels = len([
+                    ch_id for ch_id in server_info.channels.keys() 
+                    if ch_id in self.discord_service.monitored_announcement_channels
+                ])
+                
                 topic_indicator = ""
                 if server_name in self.server_topics:
                     topic_id = self.server_topics[server_name]
@@ -552,23 +588,89 @@ class TelegramService:
                     except:
                         topic_indicator = " ❌"
                 else:
-                    topic_indicator = " 🆕"  # New server, no topic yet
+                    topic_indicator = " 🆕"
+                
+                # Server button with info (truncate long names)
+                display_name = server_name[:25] + "..." if len(server_name) > 25 else server_name
+                button_text = f"{display_name}{topic_indicator}"
+                if monitored_channels > 0:
+                    button_text += f" ({monitored_channels}📢)"
                 
                 markup.add(InlineKeyboardButton(
-                    f"{server_name}{topic_indicator}",
+                    button_text,
                     callback_data=f"server_{server_name}"
                 ))
             
+            # Pagination controls (only if needed)
+            if total_pages > 1:
+                pagination_buttons = []
+                
+                # Previous page button
+                if page > 0:
+                    pagination_buttons.append(
+                        InlineKeyboardButton("⬅️ Prev", callback_data=f"servers_page_{page-1}")
+                    )
+                
+                # Page indicator
+                pagination_buttons.append(
+                    InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="page_info")
+                )
+                
+                # Next page button
+                if page < total_pages - 1:
+                    pagination_buttons.append(
+                        InlineKeyboardButton("Next ➡️", callback_data=f"servers_page_{page+1}")
+                    )
+                
+                # Add pagination row
+                markup.row(*pagination_buttons)
+            
+            # Additional action buttons
+            markup.add(InlineKeyboardButton("🔄 Refresh", callback_data="servers"))
             markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
             
-            server_count = len(servers)
+            # Generate header text with statistics
             topic_count = len(self.server_topics)
             
+            # Count total monitored channels
+            total_monitored = 0
+            total_announcement = 0
+            total_manual = 0
+            
+            for server_info in servers.values():
+                for channel_id, channel_info in server_info.channels.items():
+                    if channel_id in self.discord_service.monitored_announcement_channels:
+                        total_monitored += 1
+                        if self._is_announcement_channel(channel_info.channel_name):
+                            total_announcement += 1
+                        else:
+                            total_manual += 1
+            
             text = (
-                f"📋 **Server Management**\n\n"
-                f"📊 {server_count} servers configured, {topic_count} topics created\n"
-                f"📋 = Has topic, ❌ = Invalid topic, 🆕 = New server\n"
-                f"🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
+                f"📋 **Server Management**"
+            )
+            
+            if total_pages > 1:
+                text += f" (Page {page+1}/{total_pages})"
+            
+            text += (
+                f"\n\n📊 **Overview:**\n"
+                f"• Total servers: {total_servers}\n"
+                f"• Topics created: {topic_count}\n"
+                f"• Monitored channels: {total_monitored}\n"
+                f"  └ 📢 Announcement: {total_announcement}\n"
+                f"  └ 📝 Manual: {total_manual}\n\n"
+                f"🛡️ Anti-duplicate: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
+            )
+            
+            if total_pages > 1:
+                text += f"**Servers {start_idx+1}-{end_idx} of {total_servers}:**\n"
+            else:
+                text += "**Servers:**\n"
+            
+            text += (
+                f"📋 = Has topic, ❌ = Invalid topic, 🆕 = No topic\n"
+                f"(Number) = Monitored channels\n\n"
                 f"Select a server to manage:"
             )
             
@@ -593,6 +695,72 @@ class TelegramService:
                 )
             except:
                 pass
+            
+    def _handle_servers_pagination(self, call):
+        """Handle server pagination"""
+        try:
+            # Extract page number from callback data
+            if call.data.startswith('servers_page_'):
+                page_str = call.data.replace('servers_page_', '')
+                if page_str.isdigit():
+                    page = int(page_str)
+                    # Modify call data to trigger servers list with specific page
+                    original_data = call.data
+                    call.data = "servers"  # Set to servers to use existing handler
+                    # Store page in a temporary attribute
+                    call._page = page
+                    self._handle_servers_list(call)
+                    # Restore original data
+                    call.data = original_data
+                    return
+            
+            # If we get here, something went wrong
+            self.logger.warning(f"Invalid pagination data: {call.data}")
+            self.bot.answer_callback_query(call.id, "❌ Invalid page request")
+            
+        except Exception as e:
+            self.logger.error(f"Error in servers pagination: {e}")
+            self.bot.answer_callback_query(call.id, "❌ Pagination error")
+    
+    async def _fetch_all_guilds_from_all_tokens(self) -> List[dict]:
+        """Получить ВСЕ гильдии со всех доступных токенов"""
+        all_guilds = []
+        seen_guild_ids = set()
+        
+        self.logger.info(f"🔍 Fetching guilds from {len(self.sessions)} tokens...")
+        
+        # Создаем задачи для всех токенов
+        fetch_tasks = []
+        for i, session in enumerate(self.sessions):
+            task = self._fetch_guilds_from_single_token(session, i)
+            fetch_tasks.append(task)
+        
+        # Выполняем запросы параллельно
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        
+        # Объединяем результаты, убирая дубликаты
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                self.logger.error(f"❌ Token {i} failed to fetch guilds: {result}")
+                continue
+            
+            if not result:
+                self.logger.warning(f"⚠️ Token {i} returned no guilds")
+                continue
+                
+            self.logger.info(f"✅ Token {i}: {len(result)} guilds found")
+            
+            for guild in result:
+                guild_id = guild.get('id')
+                if guild_id and guild_id not in seen_guild_ids:
+                    seen_guild_ids.add(guild_id)
+                    guild['_source_token'] = i  # Помечаем источник
+                    all_guilds.append(guild)
+        
+        self.logger.info(f"📊 Total unique guilds collected: {len(all_guilds)} from {len(self.sessions)} tokens")
+        return all_guilds
+    
+    
     
     def _handle_manual_sync(self, call):
         """Handle manual sync request"""

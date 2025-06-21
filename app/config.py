@@ -1,4 +1,4 @@
-# app/config.py - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# app/config.py - ИСПРАВЛЕНА ПРОБЛЕМА КЕШИРОВАНИЯ
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from typing import List, Dict, Optional
@@ -7,11 +7,13 @@ import os
 import logging
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# ИСПРАВЛЕНИЕ 1: Перезагружаем .env при каждом вызове
+def reload_env():
+    """Принудительная перезагрузка переменных окружения"""
+    load_dotenv(override=True)  # override=True заставляет перезагрузить
 
 class Settings(BaseSettings):
-    """Application settings with validation for flexible channel limits"""
+    """Application settings с автоматической перезагрузкой конфигурации"""
     
     # Application Settings
     app_name: str = "Discord Telegram Parser MVP"
@@ -36,19 +38,19 @@ class Settings(BaseSettings):
     # Server/Channel Mappings (will be populated dynamically)
     server_channel_mappings: Dict[str, Dict[str, str]] = Field(default_factory=dict)
     
-    # ИСПРАВЛЕНО: Более гибкие лимиты 
-    max_channels_per_server: int = Field(default=5, ge=1, le=20, env="MAX_CHANNELS_PER_SERVER")
-    max_total_channels: int = Field(default=100, ge=10, le=500, env="MAX_TOTAL_CHANNELS")  # Снижен минимум до 10
-    max_servers: int = Field(default=50, ge=5, le=100, env="MAX_SERVERS")  # Снижен минимум до 5
+    # Лимиты 
+    max_channels_per_server: int = Field(default=10, ge=1, le=50, env="MAX_CHANNELS_PER_SERVER")
+    max_total_channels: int = Field(default=1000, ge=50, le=2000, env="MAX_TOTAL_CHANNELS")
+    max_servers: int = Field(default=200, ge=10, le=500, env="MAX_SERVERS")
     
     # Rate Limiting
     discord_rate_limit_per_second: float = Field(default=1.5, ge=0.5, le=5.0, env="DISCORD_RATE_LIMIT_PER_SECOND")
     telegram_rate_limit_per_minute: int = Field(default=30, ge=5, le=100, env="TELEGRAM_RATE_LIMIT_PER_MINUTE")
     
     # Message Processing
-    max_message_length: int = Field(default=4000, ge=1000, le=4096)
-    message_batch_size: int = Field(default=5, ge=1, le=20)
-    max_history_messages: int = Field(default=50, ge=5, le=200)  # Снижен минимум
+    max_history_messages: int = Field(default=100, ge=10, le=500)
+    max_concurrent_server_processing: int = Field(default=15, ge=5, le=50, env="MAX_CONCURRENT_SERVER_PROCESSING")
+    server_discovery_batch_size: int = Field(default=20, ge=10, le=50, env="SERVER_DISCOVERY_BATCH_SIZE")
     
     # Message TTL for deduplication
     message_ttl_seconds: int = Field(
@@ -90,7 +92,7 @@ class Settings(BaseSettings):
     # Health Check Configuration
     health_check_interval: int = Field(default=120, ge=30, le=300)
     
-    # НОВОЕ: Специальные настройки для большого количества серверов
+    # Специальные настройки для большого количества серверов
     max_concurrent_server_processing: int = Field(default=5, ge=1, le=20, env="MAX_CONCURRENT_SERVER_PROCESSING")
     server_discovery_batch_size: int = Field(default=10, ge=5, le=25, env="SERVER_DISCOVERY_BATCH_SIZE")
     channel_test_timeout: int = Field(default=5, ge=2, le=15, env="CHANNEL_TEST_TIMEOUT")
@@ -124,7 +126,7 @@ class Settings(BaseSettings):
     @field_validator('max_total_channels')
     @classmethod
     def validate_channel_limits(cls, v, info):
-        """ИСПРАВЛЕНО: Более гибкая валидация лимитов каналов"""
+        """Гибкая валидация лимитов каналов"""
         if info.data:
             max_per_server = info.data.get('max_channels_per_server', 5)
             max_servers = info.data.get('max_servers', 50)
@@ -209,11 +211,83 @@ class Settings(BaseSettings):
         "populate_by_name": True
     }
 
-# Global settings instance with caching
-@lru_cache()
-def get_settings() -> Settings:
-    """Get cached settings instance"""
+# ИСПРАВЛЕНИЕ 2: Кеш с возможностью сброса
+_settings_cache = None
+_env_file_mtime = None
+
+def clear_settings_cache():
+    """Очистить кеш настроек (полезно для hot reload)"""
+    global _settings_cache, _env_file_mtime
+    _settings_cache = None
+    _env_file_mtime = None
+    print("🔄 Settings cache cleared")
+
+def get_settings(force_reload: bool = False) -> Settings:
+    """Get cached settings instance с возможностью принудительной перезагрузки"""
+    global _settings_cache, _env_file_mtime
+    
+    env_file_path = ".env"
+    current_mtime = None
+    
+    # Проверяем время модификации .env файла
+    try:
+        if os.path.exists(env_file_path):
+            current_mtime = os.path.getmtime(env_file_path)
+    except Exception:
+        pass
+    
+    # Принудительная перезагрузка или изменился .env файл
+    if force_reload or _settings_cache is None or current_mtime != _env_file_mtime:
+        print(f"🔄 {'Force reload' if force_reload else 'Auto reload'} - creating new settings instance")
+        
+        # Перезагружаем переменные окружения
+        reload_env()
+        
+        # Создаем новый экземпляр настроек
+        _settings_cache = Settings()
+        _env_file_mtime = current_mtime
+        
+        print(f"✅ New settings loaded:")
+        print(f"   • Discord tokens: {_settings_cache.discord_tokens_count}")
+        print(f"   • Telegram chat ID: {_settings_cache.telegram_chat_id}")
+        print(f"   • Bot token preview: {_settings_cache.telegram_bot_token[:10]}...")
+        print(f"   • Use topics: {_settings_cache.use_topics}")
+    
+    return _settings_cache
+
+# ИСПРАВЛЕНИЕ 3: Функции для принудительной перезагрузки
+def reload_settings():
+    """Принудительная перезагрузка настроек"""
+    return get_settings(force_reload=True)
+
+def get_fresh_settings() -> Settings:
+    """Получить всегда свежие настройки (без кеша)"""
+    reload_env()
     return Settings()
 
-# Note: Removed global settings instantiation to avoid import-time issues
-# Use get_settings() instead of accessing settings directly
+# ИСПРАВЛЕНИЕ 4: Дебаг функция для проверки текущих настроек
+def debug_current_settings():
+    """Показать текущие настройки для отладки"""
+    settings = get_settings()
+    
+    print("🔍 Current Settings Debug:")
+    print("=" * 40)
+    print(f"Discord tokens count: {settings.discord_tokens_count}")
+    print(f"Discord tokens preview: {[t[:10] + '...' for t in settings.discord_tokens]}")
+    print(f"Telegram bot token: {settings.telegram_bot_token[:15]}...")
+    print(f"Telegram chat ID: {settings.telegram_chat_id}")
+    print(f"Use topics: {settings.use_topics}")
+    print(f"Debug mode: {settings.debug}")
+    print(f"Log level: {settings.log_level}")
+    
+    # Проверим также переменные окружения напрямую
+    print("\n🔍 Environment Variables:")
+    print("=" * 40)
+    print(f"DISCORD_AUTH_TOKENS: {os.getenv('DISCORD_AUTH_TOKENS', 'NOT SET')[:20]}...")
+    print(f"TELEGRAM_BOT_TOKEN: {os.getenv('TELEGRAM_BOT_TOKEN', 'NOT SET')[:15]}...")
+    print(f"TELEGRAM_CHAT_ID: {os.getenv('TELEGRAM_CHAT_ID', 'NOT SET')}")
+    print(f"TELEGRAM_USE_TOPICS: {os.getenv('TELEGRAM_USE_TOPICS', 'NOT SET')}")
+    
+    return settings
+
+# Не используем @lru_cache() по умолчанию - это было источником проблемы!
