@@ -439,36 +439,51 @@ class MessageProcessor:
                                 channel=message.channel_name)
                 return
             
-            # Send to Telegram immediately
-            success = await self.telegram_service.send_message(message)
+            # Send to Telegram with retry logic
+            try:
+                success = await self.telegram_service.send_message(message)
+                
+                if success:
+                    self.stats.messages_processed_today += 1
+                    self.stats.messages_processed_total += 1
+                    self.server_message_counts[message.server_name] += 1
+                    
+                    # Update last processed time for this channel
+                    self.last_processed_message_per_channel[message.channel_id] = message.timestamp
+                    
+                    # Cache in Redis if available
+                    if self.redis_client:
+                        await self._cache_message_in_redis(message)
+                    
+                    channel_type = "announcement" if self._is_announcement_channel(message.channel_name) else "regular"
+                    self.logger.info("✅ NEW real-time message processed and sent",
+                                   server=message.server_name,
+                                   channel=message.channel_name,
+                                   channel_type=channel_type,
+                                   total_today=self.stats.messages_processed_today,
+                                   server_total=self.server_message_counts[message.server_name])
+                else:
+                    self.stats.errors_last_hour += 1
+                    self.stats.last_error = "Failed to send real-time message to Telegram"
+                    self.stats.last_error_time = datetime.now()
+                    
+                    self.logger.error("Failed to process real-time message",
+                                    server=message.server_name,
+                                    channel=message.channel_name)
             
-            if success:
-                self.stats.messages_processed_today += 1
-                self.stats.messages_processed_total += 1
-                self.server_message_counts[message.server_name] += 1
-                
-                # Update last processed time for this channel
-                self.last_processed_message_per_channel[message.channel_id] = message.timestamp
-                
-                # Cache in Redis if available
-                if self.redis_client:
-                    await self._cache_message_in_redis(message)
-                
-                channel_type = "announcement" if self._is_announcement_channel(message.channel_name) else "regular"
-                self.logger.info("✅ NEW real-time message processed and sent",
-                               server=message.server_name,
-                               channel=message.channel_name,
-                               channel_type=channel_type,
-                               total_today=self.stats.messages_processed_today,
-                               server_total=self.server_message_counts[message.server_name])
-            else:
+            except Exception as e:
                 self.stats.errors_last_hour += 1
-                self.stats.last_error = "Failed to send real-time message to Telegram"
+                self.stats.last_error = f"Telegram send error: {str(e)}"
                 self.stats.last_error_time = datetime.now()
                 
-                self.logger.error("Failed to process real-time message",
-                                server=message.server_name,
-                                channel=message.channel_name)
+                if "message thread not found" in str(e).lower():
+                    self.logger.warning("Telegram topic not found, will retry in next sync",
+                                      server=message.server_name,
+                                      channel=message.channel_name)
+                else:
+                    self.logger.error("Error sending message to Telegram",
+                                    server=message.server_name,
+                                    error=str(e))
             
         except Exception as e:
             self.logger.error("Error processing real-time message", 
@@ -580,23 +595,34 @@ class MessageProcessor:
                                 self.last_processed_message_per_channel[channel_id] = msg.timestamp
             
             except Exception as e:
-                        self.logger.error("Error in missed messages check",
-                                        server=server_name,
-                                        channel_id=channel_id,
-                                        error=str(e))
+                self.logger.error("Error in missed messages check",
+                                server=server_name,
+                                channel_id=channel_id,
+                                error=str(e))
         
         if missed_messages:
-            # Sort and send
+            # Sort and send with error handling
             missed_messages.sort(key=lambda x: x.timestamp, reverse=False)
-            sent_count = await self.telegram_service.send_messages_batch(missed_messages)
             
-            self.logger.info("Fallback sync found missed messages",
-                       server=server_name,
-                       messages_sent=sent_count,
-                       total_messages=len(missed_messages))
-            
-            # Update sync time
-            self.last_sync_times[server_name] = datetime.now()
+            try:
+                sent_count = await self.telegram_service.send_messages_batch(missed_messages)
+                
+                self.logger.info("Fallback sync found missed messages",
+                           server=server_name,
+                           messages_sent=sent_count,
+                           total_messages=len(missed_messages))
+                
+                # Update sync time
+                self.last_sync_times[server_name] = datetime.now()
+                
+            except Exception as e:
+                if "message thread not found" in str(e).lower():
+                    self.logger.warning("Topic not found during fallback sync, will retry next cycle",
+                                      server=server_name)
+                else:
+                    self.logger.error("Error sending missed messages batch",
+                                    server=server_name,
+                                    error=str(e))
     
     async def _cleanup_loop(self) -> None:
         """Periodic cleanup loop"""

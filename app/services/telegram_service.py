@@ -355,13 +355,30 @@ class TelegramService:
         
         self.logger.info("Bot handlers setup completed successfully")
     
+    # ИСПРАВЛЕНИЕ 2: Заменить метод set_discord_service в TelegramService
+
     def set_discord_service(self, discord_service):
         """Set Discord service reference for enhanced channel management"""
         self.discord_service = discord_service
-        # НОВОЕ: Устанавливаем обратную ссылку
-        if hasattr(discord_service, 'set_telegram_service_ref'):
-            discord_service.set_telegram_service_ref(self)
-        self.logger.info("Enhanced Discord service integration established")
+        
+        # ИСПРАВЛЕНИЕ: Устанавливаем обратную ссылку правильно
+        if hasattr(discord_service, 'telegram_service_ref'):
+            discord_service.telegram_service_ref = self
+        
+        # Проверяем доступность всех необходимых атрибутов
+        required_attrs = ['servers', 'monitored_announcement_channels', 'sessions']
+        missing_attrs = []
+        
+        for attr in required_attrs:
+            if not hasattr(discord_service, attr):
+                missing_attrs.append(attr)
+        
+        if missing_attrs:
+            self.logger.error(f"Discord service missing required attributes: {missing_attrs}")
+        else:
+            self.logger.info("Enhanced Discord service integration established successfully")
+            self.logger.info(f"Available servers: {len(getattr(discord_service, 'servers', {}))}")
+            self.logger.info(f"Monitored channels: {len(getattr(discord_service, 'monitored_announcement_channels', set()))}")
     
     async def initialize(self) -> bool:
         """Initialize Enhanced Telegram service with startup verification"""
@@ -516,9 +533,9 @@ class TelegramService:
             self.logger.error("Chat verification failed", error=str(e))
             return False
     
-    # Handler methods for bot interface (ИСПРАВЛЕНИЯ)
+
     def _handle_servers_list(self, call):
-        """ОБНОВЛЕНО: Список серверов с полной пагинацией"""
+        """ИСПРАВЛЕНО: Полный список серверов с пагинацией"""
         try:
             # Get page number from call attribute or callback data
             page = 0
@@ -529,19 +546,32 @@ class TelegramService:
                 if len(parts) == 2 and parts[1].isdigit():
                     page = int(parts[1])
             
-            # Check if we have Discord service
+            # ДОПОЛНИТЕЛЬНЫЕ ПРОВЕРКИ
             if not self.discord_service:
+                self.logger.error("Discord service not available in _handle_servers_list")
                 markup = InlineKeyboardMarkup()
                 markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
                 self.bot.edit_message_text(
-                    "❌ Discord service not available",
+                    "❌ Discord service not available. Please check service connection.",
                     call.message.chat.id,
                     call.message.message_id,
                     reply_markup=markup
                 )
                 return
             
-            # Get all servers
+            # Проверяем атрибут servers
+            if not hasattr(self.discord_service, 'servers'):
+                self.logger.error("Discord service missing 'servers' attribute")
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
+                self.bot.edit_message_text(
+                    "❌ Discord service not properly initialized. Missing 'servers' attribute.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=markup
+                )
+                return
+                
             servers = getattr(self.discord_service, 'servers', {})
             
             if not servers:
@@ -555,145 +585,148 @@ class TelegramService:
                 )
                 return
             
-            # Pagination settings - УВЕЛИЧЕНО для всех серверов
-            servers_per_page = 10  # Увеличено с 8 до 10
-            total_servers = len(servers)
+            # Проверяем атрибут monitored_announcement_channels
+            if not hasattr(self.discord_service, 'monitored_announcement_channels'):
+                self.logger.error("Discord service missing 'monitored_announcement_channels' attribute")
+                self.discord_service.monitored_announcement_channels = set()  # Создаем пустой set как fallback
+            
+            # ПРОДОЛЖАЕМ С ПОЛНОЙ ЛОГИКОЙ ОТОБРАЖЕНИЯ СПИСКА
+            
+            # Pagination settings
+            servers_per_page = 8
+            server_list = list(servers.keys())
+            total_servers = len(server_list)
             total_pages = (total_servers + servers_per_page - 1) // servers_per_page
             
-            # Ensure page is within valid range
+            # Ensure page is within bounds
             page = max(0, min(page, total_pages - 1))
             
             # Get servers for current page
-            server_names = list(servers.keys())
             start_idx = page * servers_per_page
             end_idx = min(start_idx + servers_per_page, total_servers)
-            page_servers = server_names[start_idx:end_idx]
+            current_page_servers = server_list[start_idx:end_idx]
             
-            # Create server buttons for current page
-            markup = InlineKeyboardMarkup()
+            # Build header
+            text = f"📋 **Discord Servers ({total_servers} total)**\n\n"
             
-            for server_name in page_servers:
-                # Get server info and topic indicator
+            if total_pages > 1:
+                text += f"📄 **Page {page + 1} of {total_pages}**\n\n"
+            
+            # Show servers on current page
+            for i, server_name in enumerate(current_page_servers, start_idx + 1):
                 server_info = servers[server_name]
-                monitored_channels = len([
-                    ch_id for ch_id in server_info.channels.keys() 
-                    if ch_id in self.discord_service.monitored_announcement_channels
-                ])
                 
-                topic_indicator = ""
-                if server_name in self.server_topics:
-                    topic_id = self.server_topics[server_name]
+                # Get server stats
+                total_channels = getattr(server_info, 'channel_count', 0)
+                accessible_channels = getattr(server_info, 'accessible_channel_count', 0)
+                
+                # Count monitored channels
+                monitored_count = 0
+                announcement_count = 0
+                for channel_id, channel_info in getattr(server_info, 'channels', {}).items():
+                    if channel_id in self.discord_service.monitored_announcement_channels:
+                        monitored_count += 1
+                        if self._is_announcement_channel(channel_info.channel_name):
+                            announcement_count += 1
+                
+                # Topic status
+                topic_id = self.server_topics.get(server_name)
+                topic_status = "❌"
+                if topic_id:
                     try:
                         topic_info = self.bot.get_forum_topic(
                             chat_id=self.settings.telegram_chat_id,
                             message_thread_id=topic_id
                         )
-                        topic_indicator = " 📋" if topic_info else " ❌"
+                        topic_status = "✅" if topic_info else "❌"
                     except:
-                        topic_indicator = " ❌"
-                else:
-                    topic_indicator = " 🆕"
+                        topic_status = "❌"
                 
-                # Server button with info (truncate long names)
-                display_name = server_name[:22] + "..." if len(server_name) > 22 else server_name
-                button_text = f"{display_name}{topic_indicator}"
-                if monitored_channels > 0:
-                    button_text += f" ({monitored_channels}📢)"
+                # Server status
+                server_status = getattr(server_info, 'status', 'unknown')
+                status_emoji = "✅" if str(server_status) == "ServerStatus.ACTIVE" or server_status == "active" else "⚠️"
+                
+                text += f"{i}. {status_emoji} **{server_name}**\n"
+                text += f"   🔗 Channels: {total_channels} total, {accessible_channels} accessible\n"
+                text += f"   🔔 Monitored: {monitored_count} ({announcement_count} announcement)\n"
+                text += f"   📋 Topic: {topic_id or 'None'} {topic_status}\n"
+                
+                # Show last sync if available
+                last_sync = getattr(server_info, 'last_sync', None)
+                if last_sync:
+                    sync_time = last_sync.strftime('%m-%d %H:%M') if hasattr(last_sync, 'strftime') else str(last_sync)[:16]
+                    text += f"   🔄 Last sync: {sync_time}\n"
+                
+                text += "\n"
+            
+            # Summary
+            total_monitored = len(self.discord_service.monitored_announcement_channels)
+            total_all_channels = sum(getattr(s, 'channel_count', 0) for s in servers.values())
+            total_accessible = sum(getattr(s, 'accessible_channel_count', 0) for s in servers.values())
+            
+            text += f"📊 **Summary:**\n"
+            text += f"• Total channels: {total_all_channels}\n"
+            text += f"• Accessible: {total_accessible}\n"
+            text += f"• Monitored: {total_monitored}\n"
+            text += f"• Active topics: {len(self.server_topics)}\n"
+            text += f"🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⏳ STARTING'}"
+            
+            # Create markup
+            markup = InlineKeyboardMarkup()
+            
+            # Add server buttons (up to 6 per page to fit in Telegram limits)
+            for server_name in current_page_servers[:6]:
+                server_info = servers[server_name]
+                monitored_count = len([
+                    ch_id for ch_id in getattr(server_info, 'channels', {}).keys()
+                    if ch_id in self.discord_service.monitored_announcement_channels
+                ])
+                
+                # Shorten server name for button if needed
+                display_name = server_name[:20] + "..." if len(server_name) > 20 else server_name
+                button_text = f"📊 {display_name} ({monitored_count})"
                 
                 markup.add(InlineKeyboardButton(
                     button_text,
                     callback_data=f"server_{server_name}"
                 ))
             
-            # УЛУЧШЕННЫЕ pagination controls
+            # Pagination buttons
             if total_pages > 1:
-                pagination_buttons = []
+                pagination_row = []
                 
-                # First page button (если не на первой странице)
-                if page > 1:
-                    pagination_buttons.append(
-                        InlineKeyboardButton("⏪ First", callback_data="servers_page_0")
-                    )
-                
-                # Previous page button
+                # Previous page
                 if page > 0:
-                    pagination_buttons.append(
-                        InlineKeyboardButton("◀️ Prev", callback_data=f"servers_page_{page-1}")
-                    )
+                    pagination_row.append(InlineKeyboardButton(
+                        "⬅️ Previous",
+                        callback_data=f"servers_page_{page - 1}"
+                    ))
                 
-                # Page indicator
-                pagination_buttons.append(
-                    InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data="page_info")
-                )
+                # Page info
+                pagination_row.append(InlineKeyboardButton(
+                    f"📄 {page + 1}/{total_pages}",
+                    callback_data="page_info"
+                ))
                 
-                # Next page button
+                # Next page
                 if page < total_pages - 1:
-                    pagination_buttons.append(
-                        InlineKeyboardButton("▶️ Next", callback_data=f"servers_page_{page+1}")
-                    )
+                    pagination_row.append(InlineKeyboardButton(
+                        "Next ➡️",
+                        callback_data=f"servers_page_{page + 1}"
+                    ))
                 
-                # Last page button (если не на последней странице)
-                if page < total_pages - 2:
-                    pagination_buttons.append(
-                        InlineKeyboardButton("⏭️ Last", callback_data=f"servers_page_{total_pages-1}")
-                    )
-                
-                # Add pagination row(s)
-                if len(pagination_buttons) <= 3:
-                    markup.row(*pagination_buttons)
-                else:
-                    # Split into two rows if too many buttons
-                    markup.row(*pagination_buttons[:3])
-                    markup.row(*pagination_buttons[3:])
+                markup.row(*pagination_row)
             
-            # Additional action buttons
-            markup.add(InlineKeyboardButton("🔄 Refresh", callback_data="servers"))
+            # Action buttons
+            action_row = []
+            action_row.append(InlineKeyboardButton("🔄 Refresh", callback_data="refresh"))
+            action_row.append(InlineKeyboardButton("📊 Stats", callback_data="status"))
+            markup.row(*action_row)
+            
+            # Back button
             markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
             
-            # Generate header text with statistics
-            topic_count = len(self.server_topics)
-            
-            # Count total monitored channels
-            total_monitored = 0
-            total_announcement = 0
-            
-            for server_info in servers.values():
-                for channel_id, channel_info in server_info.channels.items():
-                    if channel_id in self.discord_service.monitored_announcement_channels:
-                        total_monitored += 1
-                        # В текущей логике все мониторимые каналы - announcement
-                        total_announcement += 1
-            
-            text = (
-                f"📋 **Server Management**"
-            )
-            
-            if total_pages > 1:
-                text += f" (Page {page+1}/{total_pages})"
-            
-            text += (
-                f"\n\n📊 **Overview:**\n"
-                f"• Total servers: {total_servers}\n"
-                f"• Topics created: {topic_count}\n"
-                f"• Auto-found announcement channels: {total_announcement}\n"
-                f"• Strategy: Auto announcement discovery\n\n"
-                f"🛡️ Anti-duplicate: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
-            )
-            
-            if total_pages > 1:
-                text += f"**Servers {start_idx+1}-{end_idx} of {total_servers}:**\n"
-            else:
-                text += "**Servers:**\n"
-            
-            text += (
-                f"📋 = Has topic, ❌ = Invalid topic, 🆕 = No topic\n"
-                f"(Number) = Announcement channels\n\n"
-                f"💡 **Select a server to:**\n"
-                f"• View announcement channels\n"
-                f"• Browse ALL available channels\n"
-                f"• Add channels manually"
-            )
-            
+            # Send message
             self.bot.edit_message_text(
                 text,
                 call.message.chat.id,
@@ -702,22 +735,31 @@ class TelegramService:
                 parse_mode='Markdown'
             )
             
+            self.logger.info(f"Displayed servers list page {page + 1}/{total_pages}",
+                           servers_on_page=len(current_page_servers),
+                           total_servers=total_servers)
+            
         except Exception as e:
-            self.logger.error(f"Error in servers list handler: {e}")
+            self.logger.error(f"Critical error in servers list handler: {e}")
             markup = InlineKeyboardMarkup()
             markup.add(InlineKeyboardButton("🔙 Back to Menu", callback_data="start"))
             try:
                 self.bot.edit_message_text(
-                    f"❌ Error loading servers: {str(e)}",
+                    f"❌ Critical error: {str(e)[:100]}...\n\nPlease try again or contact support.",
                     call.message.chat.id,
                     call.message.message_id,
                     reply_markup=markup
                 )
-            except:
-                pass
+            except Exception as inner_e:
+                self.logger.error(f"Failed to send error message: {inner_e}")
+                # Fallback: answer callback query
+                try:
+                    self.bot.answer_callback_query(call.id, "❌ Error loading servers list")
+                except:
+                    pass
             
     def _handle_servers_pagination(self, call):
-        """Handle server pagination"""
+        """ИСПРАВЛЕНО: Обработка пагинации серверов"""
         try:
             # Extract page number from callback data
             if call.data.startswith('servers_page_'):
@@ -1998,7 +2040,7 @@ class TelegramService:
                 pass
     
     def _send_servers_list_message(self, message):
-        """Send servers list as a new message"""
+        """ИСПРАВЛЕНО: Отправка списка серверов как новое сообщение"""
         try:
             if not self.discord_service:
                 self.bot.reply_to(message, "❌ Discord service not available")
@@ -2011,38 +2053,69 @@ class TelegramService:
                 self.bot.reply_to(message, "❌ No Discord servers found")
                 return
             
+            # Проверяем наличие monitored_announcement_channels
+            if not hasattr(self.discord_service, 'monitored_announcement_channels'):
+                self.discord_service.monitored_announcement_channels = set()
+            
+            # Показываем первые 10 серверов
             text = f"📋 **Discord Servers ({len(servers)} total)**\n\n"
             
-            for server_name in list(servers.keys())[:10]:
-                topic_id = self.server_topics.get(server_name)
-                server_info = servers[server_name]
-                channel_count = getattr(server_info, 'channel_count', 0)
+            for i, (server_name, server_info) in enumerate(list(servers.items())[:10], 1):
+                # Получаем базовую информацию о сервере
+                total_channels = getattr(server_info, 'channel_count', 0)
+                accessible_channels = getattr(server_info, 'accessible_channel_count', 0)
                 
+                # Подсчитываем мониторимые каналы
+                monitored_count = 0
+                for channel_id in getattr(server_info, 'channels', {}).keys():
+                    if channel_id in self.discord_service.monitored_announcement_channels:
+                        monitored_count += 1
+                
+                # Статус топика
+                topic_id = self.server_topics.get(server_name)
                 if topic_id:
                     try:
                         topic_info = self.bot.get_forum_topic(
                             chat_id=self.settings.telegram_chat_id,
                             message_thread_id=topic_id
                         )
-                        status = "✅" if topic_info else "❌"
+                        topic_status = "✅" if topic_info else "❌"
                     except:
-                        status = "❌"
+                        topic_status = "❌"
                     
-                    text += f"• {server_name} - Topic: {topic_id} {status} ({channel_count} channels)\n"
+                    text += f"{i}. **{server_name}**\n"
+                    text += f"   📊 Channels: {total_channels} ({accessible_channels} accessible)\n"
+                    text += f"   🔔 Monitored: {monitored_count}\n"
+                    text += f"   📋 Topic: {topic_id} {topic_status}\n\n"
                 else:
-                    text += f"• {server_name} - No topic ({channel_count} channels)\n"
+                    text += f"{i}. **{server_name}**\n"
+                    text += f"   📊 Channels: {total_channels} ({accessible_channels} accessible)\n"
+                    text += f"   🔔 Monitored: {monitored_count}\n"
+                    text += f"   📋 Topic: Will be created when needed\n\n"
             
             if len(servers) > 10:
-                text += f"\n... and {len(servers) - 10} more servers"
+                text += f"... and {len(servers) - 10} more servers\n\n"
             
-            text += f"\n\n📊 Total channels: {sum(getattr(s, 'channel_count', 0) for s in servers.values())}"
-            text += f"\n🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}"
+            # Добавляем общую статистику
+            total_all_channels = sum(getattr(s, 'channel_count', 0) for s in servers.values())
+            total_accessible = sum(getattr(s, 'accessible_channel_count', 0) for s in servers.values())
+            total_monitored = len(self.discord_service.monitored_announcement_channels)
+            
+            text += f"📊 **Summary:**\n"
+            text += f"• Total channels: {total_all_channels}\n"
+            text += f"• Accessible: {total_accessible}\n"
+            text += f"• Monitored: {total_monitored}\n"
+            text += f"• Active topics: {len(self.server_topics)}\n"
+            text += f"🛡️ Anti-duplicate protection: {'✅ ACTIVE' if self.startup_verification_done else '⚠️ PENDING'}\n\n"
+            text += f"💡 Use `/start` for interactive menu with full server management"
             
             self.bot.reply_to(message, text, parse_mode='Markdown')
             
+            self.logger.info(f"Sent servers list via command: {len(servers)} servers, {total_monitored} monitored channels")
+            
         except Exception as e:
             self.logger.error(f"Error sending servers list: {e}")
-            self.bot.reply_to(message, f"❌ Error: {str(e)}")
+            self.bot.reply_to(message, f"❌ Error loading servers: {str(e)[:100]}...")
     
     def _handle_remove_channel_request(self, call):
         """Обработчик запроса на удаление канала"""
