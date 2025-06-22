@@ -214,6 +214,10 @@ class TelegramService:
                     self._handle_channel_stats(call)
                 elif data.startswith("show_all_remove_"):
                     self._handle_show_all_removable(call)
+                elif data.startswith("browse_channels_"):
+                    self._handle_browse_channels(call)
+                elif data.startswith("channel_info_"):
+                    self._handle_channel_info(call)
                 else:
                     self.logger.warning(f"⚠️ Unknown callback data: {data}")
                     try:
@@ -1391,6 +1395,151 @@ class TelegramService:
         except Exception as e:
             self.logger.error(f"Error in channel stats: {e}")
 
+    def _handle_channel_info(self, call):
+        """Обработчик информации о канале и управления им"""
+        try:
+            # Формат: channel_info_{server_name}_{channel_id}
+            parts = call.data.replace('channel_info_', '', 1).split('_', 1)
+            if len(parts) != 2:
+                self.bot.answer_callback_query(call.id, "❌ Invalid channel info format")
+                return
+                
+            server_name, channel_id = parts
+            
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'channels', {})
+            
+            if channel_id not in channels:
+                self.bot.answer_callback_query(call.id, "❌ Channel not found")
+                return
+                
+            channel_info = channels[channel_id]
+            channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
+            is_monitored = channel_id in getattr(self.discord_service, 'monitored_announcement_channels', set())
+            is_accessible = getattr(channel_info, 'http_accessible', False)
+            
+            text = (
+                f"📋 **Channel Information**\n\n"
+                f"**Server:** {server_name}\n"
+                f"**Channel:** {channel_name}\n"
+                f"**ID:** `{channel_id}`\n"
+                f"**Status:** {'✅ Monitored' if is_monitored else '❌ Not monitored'}\n"
+                f"**Access:** {'✅ Accessible' if is_accessible else '❌ Not accessible'}\n\n"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            
+            if is_monitored:
+                text += "💡 This channel is being monitored and forwarding messages to Telegram."
+                markup.add(
+                    InlineKeyboardButton("🗑️ Remove from Monitoring", callback_data=f"confirm_remove_{server_name}_{channel_id}")
+                )
+            else:
+                text += "💡 This channel is not being monitored. You can add it to monitoring."
+                markup.add(
+                    InlineKeyboardButton("➕ Add to Monitoring", callback_data=f"confirm_add_{server_name}_{channel_id}")
+                )
+            
+            markup.add(
+                InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"),
+                InlineKeyboardButton("📋 Browse Channels", callback_data=f"browse_channels_{server_name}")
+            )
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in channel info handler: {e}")
+            self.bot.answer_callback_query(call.id, f"❌ Error: {str(e)[:50]}")
+
+    def _handle_browse_channels(self, call):
+        """Обработчик просмотра всех каналов сервера"""
+        try:
+            server_name = call.data.replace('browse_channels_', '', 1)
+            
+            if not self.discord_service or server_name not in getattr(self.discord_service, 'servers', {}):
+                self.bot.answer_callback_query(call.id, "❌ Server not found")
+                return
+            
+            server_info = self.discord_service.servers[server_name]
+            channels = getattr(server_info, 'channels', {})
+            
+            if not channels:
+                self.bot.answer_callback_query(call.id, "❌ No channels found for this server")
+                return
+            
+            # Группируем каналы по категориям
+            categories = {}
+            for channel_id, channel_info in channels.items():
+                category_name = getattr(channel_info, 'category_name', 'Uncategorized')
+                if category_name not in categories:
+                    categories[category_name] = []
+                categories[category_name].append((channel_id, channel_info))
+            
+            text = (
+                f"📋 **All Channels - {server_name}**\n\n"
+                f"🔍 **{len(channels)} channels in {len(categories)} categories**\n\n"
+                f"💡 **Channel Status:**\n"
+                f"✅ = Already monitored\n"
+                f"❌ = Not monitored\n"
+                f"⚠️ = Not accessible\n\n"
+            )
+            
+            markup = InlineKeyboardMarkup()
+            
+            # Добавляем кнопки для каждой категории
+            for category_name, category_channels in sorted(categories.items()):
+                # Показываем только первые 5 каналов в категории
+                for channel_id, channel_info in category_channels[:5]:
+                    channel_name = getattr(channel_info, 'channel_name', f'Channel_{channel_id}')
+                    monitored = channel_id in getattr(self.discord_service, 'monitored_announcement_channels', set())
+                    accessible = getattr(channel_info, 'http_accessible', False)
+                    
+                    status = "✅" if monitored else ("⚠️" if not accessible else "❌")
+                    
+                    markup.add(
+                        InlineKeyboardButton(
+                            f"{status} {category_name}/{channel_name}",
+                            callback_data=f"channel_info_{server_name}_{channel_id}"
+                        )
+                    )
+                
+                # Если в категории больше 5 каналов, добавляем кнопку "Show more"
+                if len(category_channels) > 5:
+                    markup.add(
+                        InlineKeyboardButton(
+                            f"📄 Show all {len(category_channels)} channels in {category_name}",
+                            callback_data=f"show_category_{server_name}_{category_name}"
+                        )
+                    )
+            
+            # Добавляем кнопки действий
+            markup.add(
+                InlineKeyboardButton("🔙 Back to Server", callback_data=f"server_{server_name}"),
+                InlineKeyboardButton("➕ Add Channel", callback_data=f"add_channel_{server_name}")
+            )
+            
+            self.bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error browsing channels: {e}")
+            self.bot.answer_callback_query(call.id, f"❌ Error: {str(e)}")
+
     def _handle_show_all_removable(self, call):
         """Показать все каналы доступные для удаления (если их больше 10)"""
         try:
@@ -1527,6 +1676,7 @@ class TelegramService:
         except Exception as e:
             self.logger.error(f"Error getting channel management summary: {e}")
             return {"error": str(e)}
+        
     def _handle_get_messages(self, call):
         """Handle get messages request with actual message retrieval"""
         try:
