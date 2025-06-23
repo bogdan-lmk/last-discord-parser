@@ -79,16 +79,37 @@ class DiscordService:
             except Exception as e:
                 self.logger.error("Error in message callback", error=str(e))
     
-    def _is_announcement_channel(self, channel_name: str) -> bool:
-        """Проверка что канал является announcement"""
-        # Удаляем emoji и лишние пробелы из названия
-        clean_name = ''.join([c for c in channel_name if c.isalpha() or c.isspace()])
-        clean_name = ' '.join(clean_name.split()).lower()
+    def _is_announcement_channel(self, channel_name: str, channel_type: Optional[int] = None, category_name: Optional[str] = None) -> bool:
+        """Проверка что канал является announcement по названию, типу и категории"""
+        # Проверка официального типа announcement канала
+        if channel_type == 5:  # Official Discord announcement channel type
+            return True
+            
+        # Очистка названия канала и категории от emoji и лишних символов
+        clean_channel = ''.join([c for c in channel_name if c.isalpha() or c.isspace()])
+        clean_channel = ' '.join(clean_channel.split()).lower()
         
-        # Проверяем содержит ли очищенное название любое из ключевых слов
-        for keyword in self.settings.channel_keywords:
-            if keyword in clean_name:
+        clean_category = ''
+        if category_name:
+            clean_category = ''.join([c for c in category_name if c.isalpha() or c.isspace()])
+            clean_category = ' '.join(clean_category.split()).lower()
+        
+        # Ключевые слова для поиска в названиях каналов и категорий
+        announcement_keywords = [
+            'announce', 'updates' 'updates'
+        ]
+        
+        # Проверка по ключевым словам в названии канала
+        for keyword in announcement_keywords + self.settings.channel_keywords:
+            if keyword in clean_channel:
                 return True
+                
+        # Проверка по ключевым словам в названии категории
+        if clean_category:
+            for keyword in announcement_keywords + self.settings.channel_keywords:
+                if keyword in clean_category:
+                    return True
+                    
         return False
     
     async def initialize(self) -> bool:
@@ -363,22 +384,40 @@ class DiscordService:
                     await asyncio.sleep(self.base_delay * (2 ** attempt))
     
     def _find_announcement_channels_only(self, channels: List[dict]) -> List[dict]:
-        """Find announcement channels"""
+        """Find announcement channels by name, type and category"""
         announcement_channels = []
         
         for channel in channels:
-            if channel.get('type') not in [0, 5]:  # Text channels and announcement channels
+            channel_type = channel.get('type')
+            
+            # Проверяем только текстовые (0) и официальные announcement (5) каналы
+            if channel_type not in [0, 5]:
                 continue
                 
-            if self._is_announcement_channel(channel['name']):
+            # Получаем название категории если есть
+            category_name = None
+            if 'parent_id' in channel:
+                # В реальном коде здесь должна быть логика получения названия категории по parent_id
+                pass
+                
+            if self._is_announcement_channel(
+                channel['name'],
+                channel_type=channel_type,
+                category_name=category_name
+            ):
                 announcement_channels.append(channel)
                 self.logger.info(
                     "Found announcement channel", 
                     original_name=channel['name'],
-                    channel_id=channel['id']
+                    channel_id=channel['id'],
+                    channel_type=channel_type,
+                    category=category_name
                 )
         
-        self.logger.info("Total announcement channels found", count=len(announcement_channels))
+        self.logger.info("Total announcement channels found", 
+                       count=len(announcement_channels),
+                       by_type=sum(1 for c in announcement_channels if c.get('type') == 5),
+                       by_name=sum(1 for c in announcement_channels if c.get('type') != 5))
         return announcement_channels
     
     async def _test_channel_access_with_retry(self, session: aiohttp.ClientSession, channel_id: str) -> bool:
@@ -873,6 +912,35 @@ class DiscordService:
             self.logger.error(f"Error in notify_new_channel_added: {e}")
             return False
     
+    def get_non_announcement_servers(self) -> List[Dict[str, any]]:
+        """Get servers without announcement channels"""
+        result = []
+        for server_name, server in self.servers.items():
+            has_announcement = any(
+                self._is_announcement_channel(ch.channel_name) 
+                for ch in server.channels.values()
+            )
+            if not has_announcement:
+                result.append({
+                    'name': server_name,
+                    'id': server.guild_id,
+                    'channel_count': len(server.channels)
+                })
+        return result
+
+    def get_server_channels(self, server_name: str) -> List[Dict[str, any]]:
+        """Get all channels for specified server"""
+        if server_name not in self.servers:
+            return []
+            
+        server = self.servers[server_name]
+        return [{
+            'id': ch.channel_id,
+            'name': ch.channel_name,
+            'is_announcement': self._is_announcement_channel(ch.channel_name),
+            'accessible': ch.http_accessible
+        } for ch in server.channels.values()]
+
     def get_server_stats(self) -> Dict[str, any]:
         """Get statistics for servers with monitored channels"""
         monitored_channels_count = len(self.monitored_announcement_channels)
