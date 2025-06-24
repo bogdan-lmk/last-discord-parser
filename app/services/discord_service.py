@@ -1,4 +1,4 @@
-# app/services/discord_service.py - ИСПРАВЛЕННАЯ ВЕРСИЯ без дублирования в polling
+# app/services/discord_service.py - ПОЛНАЯ РЕАЛИЗАЦИЯ WebSocket
 import aiohttp
 import asyncio
 import json
@@ -13,7 +13,7 @@ from ..config import Settings
 from ..utils.rate_limiter import RateLimiter
 
 class DiscordService:
-    """Discord service - БЕЗ дублирования сообщений в polling"""
+    """Discord service с полной WebSocket реализацией"""
     
     def __init__(self, 
                  settings: Settings,
@@ -34,15 +34,17 @@ class DiscordService:
         
         # Server tracking
         self.servers: Dict[str, ServerInfo] = {}
-        self.websocket_connections: List[aiohttp.ClientWebSocketResponse] = []
+        
+        # WebSocket management
+        self.websocket_connections: List[Dict] = []  # List of connection info
+        self.gateway_urls: List[str] = []  # Gateway URLs for each token
         
         # Channel monitoring
         self.message_callbacks: List[Callable] = []
         self.monitored_announcement_channels: Set[str] = set()
         
-        # НОВОЕ: Отслеживание последних сообщений для polling
-        self.last_seen_message_per_channel: Dict[str, str] = {}  # channel_id -> last_message_id
-        self.channel_last_poll_time: Dict[str, datetime] = {}  # channel_id -> last_poll_time
+        # WebSocket state tracking
+        self.websocket_sessions: Dict[int, Dict] = {}  # token_index -> session_info
         
         # State
         self.running = False
@@ -56,6 +58,9 @@ class DiscordService:
         self.max_retries = 3
         self.base_delay = 1.0
         self.max_delay = 60.0
+        
+        # WebSocket intents (GUILDS + GUILD_MESSAGES)
+        self.intents = (1 << 0) | (1 << 9)  # GUILDS + GUILD_MESSAGES
     
     def add_message_callback(self, callback: Callable):
         """Add callback for real-time messages"""
@@ -81,10 +86,6 @@ class DiscordService:
     
     def _is_announcement_channel(self, channel_name: str, channel_type: Optional[int] = None, category_name: Optional[str] = None) -> bool:
         """Проверка что канал является announcement по названию, типу и категории"""
-        # Проверка официального типа announcement канала
-        if channel_type == 5:  # Official Discord announcement channel type
-            return True
-            
         # Очистка названия канала и категории от emoji и лишних символов
         clean_channel = ''.join([c for c in channel_name if c.isalpha() or c.isspace()])
         clean_channel = ' '.join(clean_channel.split()).lower()
@@ -96,7 +97,11 @@ class DiscordService:
         
         # Ключевые слова для поиска в названиях каналов и категорий
         announcement_keywords = [
-            'announce', 'updates' 'updates'
+            'announce', 'updates', 'big-announcements',
+            'news', 'announcements', 'announcement',
+            'project-announcements', '📢┋announcements',
+            '📢・announcements', '📢│big-announcements',
+            '🐚┋announcements', '🗣・announcements'
         ]
         
         # Проверка по ключевым словам в названии канала
@@ -117,17 +122,17 @@ class DiscordService:
         if self._initialization_done:
             return True
             
-        self.logger.info("Initializing Discord service with anti-duplication polling", 
+        self.logger.info("Initializing Discord service with WebSocket monitoring", 
                         token_count=len(self.settings.discord_tokens),
                         max_servers=self.settings.max_servers,
                         max_channels_total=self.settings.max_total_channels)
         
-        # Create sessions
+        # Create sessions and get gateway URLs
         successful_tokens = 0
         for i, token in enumerate(self.settings.discord_tokens):
             session = aiohttp.ClientSession(
                 headers={
-                    'Authorization': token,
+                    'Authorization': f'Bot {token}' if not token.startswith('Bot ') else token,
                     'User-Agent': 'DiscordBot (Discord-Parser-MVP, 1.0)'
                 },
                 timeout=aiohttp.ClientTimeout(total=30, connect=10),
@@ -139,14 +144,14 @@ class DiscordService:
                 )
             )
             
-            if await self._validate_token_with_retry(session, i):
+            if await self._validate_token_and_get_gateway(session, i):
                 self.sessions.append(session)
                 self.token_failure_counts[i] = 0
                 successful_tokens += 1
-                self.logger.info("Token validated successfully", token_index=i)
+                self.logger.info("Token validated and gateway obtained", token_index=i)
             else:
                 await session.close()
-                self.logger.error("Token validation failed permanently", token_index=i)
+                self.logger.error("Token validation or gateway retrieval failed", token_index=i)
         
         if not self.sessions:
             self.logger.error("No valid Discord tokens available")
@@ -156,14 +161,15 @@ class DiscordService:
         await self._discover_announcement_channels_only()
         
         self._initialization_done = True
-        self.logger.info("Discord service initialized with anti-duplication", 
+        self.logger.info("Discord service initialized with WebSocket support", 
                         valid_tokens=len(self.sessions),
                         servers_found=len(self.servers),
-                        announcement_channels=len(self.monitored_announcement_channels))
+                        announcement_channels=len(self.monitored_announcement_channels),
+                        gateway_urls=len(self.gateway_urls))
         return True
     
-    async def _validate_token_with_retry(self, session: aiohttp.ClientSession, token_index: int) -> bool:
-        """Validate token with retry logic"""
+    async def _validate_token_and_get_gateway(self, session: aiohttp.ClientSession, token_index: int) -> bool:
+        """Validate token and get gateway URL"""
         for attempt in range(self.max_retries):
             try:
                 if attempt > 0:
@@ -172,7 +178,8 @@ class DiscordService:
                 
                 await self.rate_limiter.wait_if_needed(f"token_validate_{token_index}")
                 
-                async with session.get('https://discord.com/api/v9/users/@me') as response:
+                # Validate token
+                async with session.get('https://discord.com/api/v10/users/@me') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
                         self.logger.warning("Rate limited during token validation", 
@@ -202,8 +209,39 @@ class DiscordService:
                                    username=user_data.get('username'),
                                    token_index=token_index)
                 
+                # Get gateway URL
+                async with session.get('https://discord.com/api/v10/gateway/bot') as gateway_response:
+                    if gateway_response.status == 429:
+                        retry_after = float(gateway_response.headers.get('Retry-After', 60))
+                        if attempt < self.max_retries - 1:
+                            await asyncio.sleep(min(retry_after, 60))
+                            continue
+                        else:
+                            return False
+                    
+                    if gateway_response.status != 200:
+                        self.logger.error("Gateway URL retrieval failed", 
+                                        token_index=token_index,
+                                        status=gateway_response.status)
+                        if gateway_response.status in [401, 403]:
+                            return False
+                        continue
+                    
+                    gateway_data = await gateway_response.json()
+                    gateway_url = gateway_data.get('url')
+                    
+                    if not gateway_url:
+                        self.logger.error("No gateway URL in response", token_index=token_index)
+                        continue
+                    
+                    self.gateway_urls.append(gateway_url)
+                    self.logger.info("Gateway URL obtained", 
+                                   token_index=token_index,
+                                   gateway_url=gateway_url,
+                                   session_limit=gateway_data.get('session_start_limit', {}))
+                
                 # Test guild access
-                async with session.get('https://discord.com/api/v9/users/@me/guilds') as guilds_res:
+                async with session.get('https://discord.com/api/v10/users/@me/guilds') as guilds_res:
                     if guilds_res.status == 429:
                         retry_after = float(guilds_res.headers.get('Retry-After', 60))
                         if attempt < self.max_retries - 1:
@@ -253,7 +291,7 @@ class DiscordService:
                 
                 await self.rate_limiter.wait_if_needed("discover_guilds")
                 
-                async with session.get('https://discord.com/api/v9/users/@me/guilds') as response:
+                async with session.get('https://discord.com/api/v10/users/@me/guilds') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
                         await asyncio.sleep(min(retry_after, 60))
@@ -303,7 +341,7 @@ class DiscordService:
             try:
                 await self.rate_limiter.wait_if_needed(f"guild_{guild_id}")
                 
-                async with session.get(f'https://discord.com/api/v9/guilds/{guild_id}/channels') as response:
+                async with session.get(f'https://discord.com/api/v10/guilds/{guild_id}/channels') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
                         await asyncio.sleep(min(retry_after, 60))
@@ -353,9 +391,6 @@ class DiscordService:
                         # Add to monitored channels if accessible
                         if channel_info.http_accessible:
                             self.monitored_announcement_channels.add(channel['id'])
-                            # НОВОЕ: Инициализируем отслеживание для polling
-                            self.last_seen_message_per_channel[channel['id']] = None
-                            self.channel_last_poll_time[channel['id']] = datetime.now()
                     
                     # Update server stats
                     server_info.update_stats()
@@ -426,7 +461,7 @@ class DiscordService:
             try:
                 await self.rate_limiter.wait_if_needed(f"test_channel_{channel_id}")
                 
-                async with session.get(f'https://discord.com/api/v9/channels/{channel_id}/messages?limit=1') as response:
+                async with session.get(f'https://discord.com/api/v10/channels/{channel_id}/messages?limit=1') as response:
                     if response.status == 429:
                         retry_after = float(response.headers.get('Retry-After', 60))
                         await asyncio.sleep(min(retry_after, 60))
@@ -456,7 +491,7 @@ class DiscordService:
     async def get_recent_messages(self, 
                              server_name: str, 
                              channel_id: str, 
-                             limit: int = 5) -> List[DiscordMessage]:
+                             limit: int = 2) -> List[DiscordMessage]:
         """Get recent messages from channel"""
         if server_name not in self.servers:
             self.logger.warning("Server not found", server=server_name)
@@ -489,14 +524,14 @@ class DiscordService:
             return []
 
         messages = []
-        actual_limit = min(limit, 20)  # Increased limit for better message retrieval
+        actual_limit = min(limit, 20)
         
         for attempt in range(self.max_retries):
             try:
                 await self.rate_limiter.wait_if_needed(f"messages_{channel_id}")
                 
                 async with session.get(
-                    f'https://discord.com/api/v9/channels/{channel_id}/messages',
+                    f'https://discord.com/api/v10/channels/{channel_id}/messages',
                     params={'limit': actual_limit}
                 ) as response:
                     
@@ -586,116 +621,6 @@ class DiscordService:
         
         return []
     
-    async def get_new_messages_only(self, 
-                                  server_name: str, 
-                                  channel_id: str, 
-                                  limit: int = 10) -> List[DiscordMessage]:
-        """НОВОЕ: Get only NEW messages since last poll (для polling без дублирования)"""
-        if server_name not in self.servers:
-            return []
-
-        server = self.servers[server_name]
-        if channel_id not in server.channels:
-            return []
-
-        channel = server.channels[channel_id]
-        
-        if channel_id not in self.monitored_announcement_channels:
-            return []
-
-        if not channel.http_accessible:
-            return []
-
-        session = self._get_healthy_session()
-        if not session:
-            return []
-
-        # Получаем последний известный message_id для этого канала
-        last_seen_message_id = self.last_seen_message_per_channel.get(channel_id)
-        
-        messages = []
-        actual_limit = min(limit, 20)
-        
-        try:
-            await self.rate_limiter.wait_if_needed(f"new_messages_{channel_id}")
-            
-            # Строим URL для получения сообщений
-            url = f'https://discord.com/api/v9/channels/{channel_id}/messages'
-            params = {'limit': actual_limit}
-            
-            # Если есть последнее сообщение, получаем только сообщения после него
-            if last_seen_message_id:
-                params['after'] = last_seen_message_id
-            
-            async with session.get(url, params=params) as response:
-                if response.status != 200:
-                    self.logger.warning("Failed to fetch new messages", 
-                                      channel_id=channel_id,
-                                      status=response.status)
-                    return []
-                
-                raw_messages = await response.json()
-                self.rate_limiter.record_success()
-                
-                # Если нет новых сообщений
-                if not raw_messages:
-                    self.logger.debug("No new messages found", 
-                                    channel_id=channel_id,
-                                    last_seen=last_seen_message_id)
-                    return []
-                
-                # Convert to DiscordMessage objects
-                for raw_msg in raw_messages:
-                    try:
-                        if not raw_msg.get('content', '').strip():
-                            continue
-                            
-                        message = DiscordMessage(
-                            content=raw_msg['content'],
-                            timestamp=datetime.fromisoformat(
-                                raw_msg['timestamp'].replace('Z', '+00:00')
-                            ),
-                            server_name=server_name,
-                            channel_name=channel.channel_name,
-                            author=raw_msg['author']['username'],
-                            message_id=raw_msg['id'],
-                            channel_id=channel_id,
-                            guild_id=server.guild_id
-                        )
-                        messages.append(message)
-                        
-                    except Exception as e:
-                        self.logger.warning("Failed to parse new message", 
-                                          message_id=raw_msg.get('id'),
-                                          error=str(e))
-                        continue
-                
-                # Обновляем последний известный message_id
-                if messages:
-                    # Сортируем по timestamp и берем самое новое
-                    latest_message = max(messages, key=lambda x: x.timestamp)
-                    self.last_seen_message_per_channel[channel_id] = latest_message.message_id
-                    
-                    self.logger.info("Found NEW messages in polling", 
-                                   channel_id=channel_id,
-                                   channel_name=channel.channel_name,
-                                   new_message_count=len(messages),
-                                   latest_message_id=latest_message.message_id)
-                
-                # Обновляем время последнего polling
-                self.channel_last_poll_time[channel_id] = datetime.now()
-                
-                return sorted(messages, key=lambda x: x.timestamp)
-                
-        except Exception as e:
-            self.logger.error("Error getting new messages", 
-                            server=server_name,
-                            channel_id=channel_id,
-                            error=str(e))
-            self.rate_limiter.record_error()
-        
-        return []
-    
     def set_telegram_service_ref(self, telegram_service):
         """Set reference to Telegram service for integration"""
         self.telegram_service_ref = telegram_service
@@ -729,151 +654,439 @@ class DiscordService:
         self.token_failure_counts = {i: 0 for i in range(len(self.sessions))}
         return self.sessions[0]
     
-    async def _http_polling_loop_new_messages_only(self) -> None:
-        """ИСПРАВЛЕНО: HTTP polling - ТОЛЬКО новые сообщения"""
-        base_poll_interval = 30  # Poll every 30 seconds for new messages
-        error_count = 0
-        
-        while self.running:
-            try:
-                poll_start = datetime.now()
-                
-                # Группируем каналы по серверам для эффективности
-                server_channel_map = {}
-                for channel_id in self.monitored_announcement_channels:
-                    # Найти сервер для этого канала
-                    server_name = None
-                    for srv_name, srv_info in self.servers.items():
-                        if srv_info.status != ServerStatus.ACTIVE:
-                            continue
-                        if channel_id in srv_info.channels:
-                            server_name = srv_name
-                            break
-                    
-                    if server_name:
-                        if server_name not in server_channel_map:
-                            server_channel_map[server_name] = []
-                        server_channel_map[server_name].append(channel_id)
-                
-                # Создаем задачи для polling ТОЛЬКО новых сообщений
-                tasks = []
-                for server_name, channel_ids in server_channel_map.items():
-                    for channel_id in channel_ids:
-                        task = self._poll_channel_for_new_messages_only(server_name, channel_id)
-                        tasks.append(task)
-                
-                if tasks:
-                    semaphore = asyncio.Semaphore(3)
-                    
-                    async def poll_with_semaphore(task):
-                        async with semaphore:
-                            return await task
-                    
-                    results = await asyncio.gather(
-                        *[poll_with_semaphore(task) for task in tasks],
-                        return_exceptions=True
-                    )
-                    
-                    successful_polls = sum(1 for result in results if result and not isinstance(result, Exception))
-                    new_messages_found = sum(result if isinstance(result, int) and result > 0 else 0 for result in results)
-                    
-                    # Подсчет типов каналов для статистики
-                    announcement_polls = 0
-                    regular_polls = 0
-                    for server_name, channel_ids in server_channel_map.items():
-                        for channel_id in channel_ids:
-                            if server_name in self.servers and channel_id in self.servers[server_name].channels:
-                                channel_info = self.servers[server_name].channels[channel_id]
-                                if self._is_announcement_channel(channel_info.channel_name):
-                                    announcement_polls += 1
-                                else:
-                                    regular_polls += 1
-                    
-                    if new_messages_found > 0:
-                        self.logger.info("New messages polling cycle completed", 
-                                    total_polls=len(tasks),
-                                    successful_polls=successful_polls,
-                                    new_messages_found=new_messages_found,
-                                    announcement_channels=announcement_polls,
-                                    regular_channels=regular_polls,
-                                    duration_seconds=(datetime.now() - poll_start).total_seconds())
-                    else:
-                        self.logger.debug("Polling cycle completed - no new messages", 
-                                    total_polls=len(tasks),
-                                    successful_polls=successful_polls)
-                    
-                    error_count = 0
-                else:
-                    self.logger.debug("No monitored channels to poll")
-                
-                # Adaptive polling interval
-                poll_interval = base_poll_interval
-                if error_count > 3:
-                    poll_interval = min(300, base_poll_interval * (2 ** min(error_count - 3, 3)))
-                
-                await asyncio.sleep(poll_interval)
-                
-            except Exception as e:
-                error_count += 1
-                self.logger.error("Error in new messages polling loop", 
-                                error=str(e),
-                                error_count=error_count)
-                
-                error_delay = min(300, 30 * (2 ** min(error_count, 4)))
-                await asyncio.sleep(error_delay)
-    
-    async def _poll_channel_for_new_messages_only(self, server_name: str, channel_id: str) -> int:
-        """ИСПРАВЛЕНО: Poll канал ТОЛЬКО для новых сообщений"""
-        try:
-            # Получаем ТОЛЬКО новые сообщения
-            new_messages = await self.get_new_messages_only(server_name, channel_id, limit=10)
-            
-            if new_messages:
-                channel_info = self.servers[server_name].channels[channel_id]
-                channel_type = "announcement" if self._is_announcement_channel(channel_info.channel_name) else "regular"
-                
-                self.logger.info("Found NEW messages during polling", 
-                                server=server_name,
-                                channel_name=channel_info.channel_name,
-                                channel_type=channel_type,
-                                channel_id=channel_id,
-                                new_message_count=len(new_messages))
-                
-                # Trigger callbacks for each NEW message
-                for message in new_messages:
-                    await self._trigger_message_callbacks(message)
-                
-                return len(new_messages)
-            else:
-                # Нет новых сообщений - это нормально
-                return 0
-            
-        except Exception as e:
-            self.logger.error("Error polling channel for new messages", 
-                            server=server_name,
-                            channel_id=channel_id,
-                            error=str(e))
-            return -1  # Ошибка
+    # ============================================================================
+    # WEBSOCKET IMPLEMENTATION - REAL DISCORD GATEWAY CONNECTION
+    # ============================================================================
     
     async def start_websocket_monitoring(self) -> None:
-        """ИСПРАВЛЕНО: Start HTTP polling для ТОЛЬКО новых сообщений"""
-        self.logger.info("Starting HTTP polling for NEW messages only", 
+        """Start REAL WebSocket monitoring with Discord Gateway"""
+        self.logger.info("🚀 Starting WebSocket monitoring", 
                     monitored_channels=len(self.monitored_announcement_channels),
-                    strategy="Poll for new messages only - no duplicates")
+                    tokens=len(self.sessions),
+                    gateway_urls=len(self.gateway_urls))
         
-        if not self.sessions:
-            self.logger.error("No valid sessions for monitoring")
+        if not self.sessions or not self.gateway_urls:
+            self.logger.error("No valid sessions or gateway URLs for WebSocket monitoring")
             return
         
         self.running = True
         
         try:
-            await self._http_polling_loop_new_messages_only()
+            # Create WebSocket connection tasks for each token
+            websocket_tasks = []
+            
+            for i, (session, gateway_url) in enumerate(zip(self.sessions, self.gateway_urls)):
+                task = asyncio.create_task(
+                    self._websocket_connection_handler(session, gateway_url, i),
+                    name=f"websocket_token_{i}"
+                )
+                websocket_tasks.append(task)
+                
+                # Stagger connection attempts to avoid rate limits
+                if i < len(self.sessions) - 1:
+                    await asyncio.sleep(5)
+            
+            self.logger.info(f"✅ Started {len(websocket_tasks)} WebSocket connections")
+            
+            # Wait for all WebSocket connections
+            await asyncio.gather(*websocket_tasks, return_exceptions=True)
+            
         except Exception as e:
-            self.logger.error("HTTP polling monitoring failed", error=str(e))
+            self.logger.error("❌ WebSocket monitoring failed", error=str(e))
         finally:
             self.running = False
+            self.logger.info("🔌 WebSocket monitoring stopped")
+    
+    async def _websocket_connection_handler(self, session: aiohttp.ClientSession, gateway_url: str, token_index: int) -> None:
+        """Handle individual WebSocket connection"""
+        connection_id = f"token_{token_index}"
+        max_reconnects = 5
+        reconnect_count = 0
+        
+        while self.running and reconnect_count < max_reconnects:
+            try:
+                self.logger.info(f"🔌 Connecting WebSocket for {connection_id}", 
+                               gateway_url=gateway_url,
+                               attempt=reconnect_count + 1)
+                
+                # Connect to Discord Gateway
+                async with session.ws_connect(
+                    f"{gateway_url}?v=10&encoding=json",
+                    timeout=aiohttp.ClientTimeout(total=None),  # No timeout for WebSocket
+                    heartbeat=30
+                ) as ws:
+                    
+                    self.logger.info(f"✅ WebSocket connected for {connection_id}")
+                    
+                    # Store connection info
+                    connection_info = {
+                        'ws': ws,
+                        'session': session,
+                        'token_index': token_index,
+                        'connected_at': datetime.now(),
+                        'sequence': None,
+                        'session_id': None,
+                        'heartbeat_task': None,
+                        'last_heartbeat': None
+                    }
+                    
+                    # Add to connections list
+                    self.websocket_connections.append(connection_info)
+                    self.websocket_sessions[token_index] = connection_info
+                    
+                    try:
+                        # Handle WebSocket messages
+                        await self._handle_websocket_messages(connection_info)
+                        
+                    except Exception as e:
+                        self.logger.error(f"❌ WebSocket message handling failed for {connection_id}", error=str(e))
+                        raise
+                    finally:
+                        # Cleanup connection
+                        if connection_info in self.websocket_connections:
+                            self.websocket_connections.remove(connection_info)
+                        if token_index in self.websocket_sessions:
+                            del self.websocket_sessions[token_index]
+                        
+                        # Cancel heartbeat task
+                        if connection_info.get('heartbeat_task'):
+                            connection_info['heartbeat_task'].cancel()
+                
+            except Exception as e:
+                reconnect_count += 1
+                self.logger.error(f"❌ WebSocket connection failed for {connection_id}", 
+                                error=str(e),
+                                reconnect_attempt=reconnect_count)
+                
+                if reconnect_count < max_reconnects and self.running:
+                    # Exponential backoff for reconnection
+                    delay = min(60, 5 * (2 ** (reconnect_count - 1)))
+                    self.logger.info(f"⏳ Reconnecting WebSocket for {connection_id} in {delay}s")
+                    await asyncio.sleep(delay)
+                else:
+                    self.logger.error(f"💀 Max reconnection attempts reached for {connection_id}")
+                    break
+        
+        self.logger.info(f"🔌 WebSocket handler stopped for {connection_id}")
+    
+    async def _handle_websocket_messages(self, connection_info: Dict) -> None:
+        """Handle WebSocket messages from Discord Gateway"""
+        ws = connection_info['ws']
+        token_index = connection_info['token_index']
+        connection_id = f"token_{token_index}"
+        
+        self.logger.info(f"👂 Starting message handler for {connection_id}")
+        
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    await self._process_gateway_event(data, connection_info)
+                    
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"❌ JSON decode error for {connection_id}", error=str(e))
+                except Exception as e:
+                    self.logger.error(f"❌ Error processing gateway event for {connection_id}", error=str(e))
+                    
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                self.logger.error(f"❌ WebSocket error for {connection_id}", error=ws.exception())
+                break
+            elif msg.type == aiohttp.WSMsgType.CLOSE:
+                self.logger.warning(f"🔌 WebSocket closed for {connection_id}")
+                break
+    
+    async def _process_gateway_event(self, data: Dict, connection_info: Dict) -> None:
+        """Process Discord Gateway event"""
+        op = data.get('op')
+        event_type = data.get('t')
+        event_data = data.get('d', {})
+        sequence = data.get('s')
+        
+        connection_id = f"token_{connection_info['token_index']}"
+        
+        # Update sequence number
+        if sequence is not None:
+            connection_info['sequence'] = sequence
+        
+        # Handle different opcodes
+        if op == 10:  # HELLO
+            await self._handle_hello(event_data, connection_info)
             
+        elif op == 11:  # HEARTBEAT_ACK
+            connection_info['last_heartbeat'] = datetime.now()
+            self.logger.debug(f"💓 Heartbeat ACK for {connection_id}")
+            
+        elif op == 0:  # DISPATCH
+            await self._handle_dispatch_event(event_type, event_data, connection_info)
+            
+        elif op == 1:  # HEARTBEAT
+            await self._send_heartbeat(connection_info)
+            
+        elif op == 7:  # RECONNECT
+            self.logger.warning(f"🔄 Discord requested reconnect for {connection_id}")
+            raise ConnectionError("Discord requested reconnect")
+            
+        elif op == 9:  # INVALID_SESSION
+            resumable = event_data if isinstance(event_data, bool) else False
+            self.logger.warning(f"❌ Invalid session for {connection_id}", resumable=resumable)
+            if not resumable:
+                connection_info['session_id'] = None
+            raise ConnectionError("Invalid session")
+            
+        else:
+            self.logger.debug(f"🔍 Unknown opcode for {connection_id}", opcode=op)
+    
+    async def _handle_hello(self, data: Dict, connection_info: Dict) -> None:
+        """Handle HELLO event from Discord Gateway"""
+        heartbeat_interval = data.get('heartbeat_interval', 41250)  # Default 41.25 seconds
+        connection_id = f"token_{connection_info['token_index']}"
+        
+        self.logger.info(f"👋 Received HELLO for {connection_id}", 
+                       heartbeat_interval=heartbeat_interval)
+        
+        # Start heartbeat task
+        connection_info['heartbeat_task'] = asyncio.create_task(
+            self._heartbeat_loop(connection_info, heartbeat_interval)
+        )
+        
+        # Send IDENTIFY or RESUME
+        if connection_info.get('session_id'):
+            await self._send_resume(connection_info)
+        else:
+            await self._send_identify(connection_info)
+    
+    async def _heartbeat_loop(self, connection_info: Dict, interval_ms: int) -> None:
+        """Send periodic heartbeats"""
+        interval_seconds = interval_ms / 1000
+        connection_id = f"token_{connection_info['token_index']}"
+        
+        # Initial random delay
+        initial_delay = random.uniform(0, interval_seconds)
+        await asyncio.sleep(initial_delay)
+        
+        while not connection_info['ws'].closed:
+            try:
+                await self._send_heartbeat(connection_info)
+                await asyncio.sleep(interval_seconds)
+                
+            except asyncio.CancelledError:
+                self.logger.debug(f"💓 Heartbeat cancelled for {connection_id}")
+                break
+            except Exception as e:
+                self.logger.error(f"❌ Heartbeat error for {connection_id}", error=str(e))
+                break
+    
+    async def _send_heartbeat(self, connection_info: Dict) -> None:
+        """Send heartbeat to Discord Gateway"""
+        ws = connection_info['ws']
+        sequence = connection_info.get('sequence')
+        connection_id = f"token_{connection_info['token_index']}"
+        
+        heartbeat_payload = {
+            "op": 1,
+            "d": sequence
+        }
+        
+        try:
+            await ws.send_str(json.dumps(heartbeat_payload))
+            self.logger.debug(f"💓 Sent heartbeat for {connection_id}", sequence=sequence)
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send heartbeat for {connection_id}", error=str(e))
+            raise
+    
+    async def _send_identify(self, connection_info: Dict) -> None:
+        """Send IDENTIFY to Discord Gateway"""
+        ws = connection_info['ws']
+        token_index = connection_info['token_index']
+        connection_id = f"token_{token_index}"
+        
+        # Get token from session headers
+        token = self.settings.discord_tokens[token_index]
+        if not token.startswith('Bot '):
+            token = f'Bot {token}'
+        
+        identify_payload = {
+            "op": 2,
+            "d": {
+                "token": token,
+                "properties": {
+                    "$os": "linux",
+                    "$browser": "discord-parser-mvp",
+                    "$device": "discord-parser-mvp"
+                },
+                "compress": False,
+                "large_threshold": 50,
+                "shard": None,  # No sharding for now
+                "presence": {
+                    "status": "online",
+                    "afk": False
+                },
+                "intents": self.intents  # GUILDS + GUILD_MESSAGES
+            }
+        }
+        
+        try:
+            await ws.send_str(json.dumps(identify_payload))
+            self.logger.info(f"🆔 Sent IDENTIFY for {connection_id}", intents=self.intents)
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send IDENTIFY for {connection_id}", error=str(e))
+            raise
+    
+    async def _send_resume(self, connection_info: Dict) -> None:
+        """Send RESUME to Discord Gateway"""
+        ws = connection_info['ws']
+        token_index = connection_info['token_index']
+        connection_id = f"token_{token_index}"
+        session_id = connection_info.get('session_id')
+        sequence = connection_info.get('sequence')
+        
+        # Get token from session headers
+        token = self.settings.discord_tokens[token_index]
+        if not token.startswith('Bot '):
+            token = f'Bot {token}'
+        
+        resume_payload = {
+            "op": 6,
+            "d": {
+                "token": token,
+                "session_id": session_id,
+                "seq": sequence
+            }
+        }
+        
+        try:
+            await ws.send_str(json.dumps(resume_payload))
+            self.logger.info(f"🔄 Sent RESUME for {connection_id}", 
+                           session_id=session_id,
+                           sequence=sequence)
+        except Exception as e:
+            self.logger.error(f"❌ Failed to send RESUME for {connection_id}", error=str(e))
+            raise
+    
+    async def _handle_dispatch_event(self, event_type: str, data: Dict, connection_info: Dict) -> None:
+        """Handle DISPATCH events from Discord Gateway"""
+        connection_id = f"token_{connection_info['token_index']}"
+        
+        if event_type == 'READY':
+            await self._handle_ready_event(data, connection_info)
+            
+        elif event_type == 'RESUMED':
+            self.logger.info(f"✅ Session resumed for {connection_id}")
+            
+        elif event_type == 'MESSAGE_CREATE':
+            await self._handle_message_create(data, connection_info)
+            
+        elif event_type == 'GUILD_CREATE':
+            self.logger.debug(f"🏰 Guild create for {connection_id}", 
+                            guild_id=data.get('id'),
+                            guild_name=data.get('name'))
+            
+        else:
+            self.logger.debug(f"🔍 Unhandled event for {connection_id}", event_type=event_type)
+    
+    async def _handle_ready_event(self, data: Dict, connection_info: Dict) -> None:
+        """Handle READY event from Discord Gateway"""
+        connection_id = f"token_{connection_info['token_index']}"
+        session_id = data.get('session_id')
+        user_data = data.get('user', {})
+        guilds = data.get('guilds', [])
+        
+        # Store session ID for resuming
+        connection_info['session_id'] = session_id
+        
+        self.logger.info(f"🚀 WebSocket READY for {connection_id}",
+                       session_id=session_id,
+                       username=user_data.get('username'),
+                       guild_count=len(guilds))
+        
+        # Log which monitored channels are available
+        monitored_count = 0
+        for guild in guilds:
+            guild_id = guild.get('id')
+            # Check if any of our monitored channels are in this guild
+            for server_info in self.servers.values():
+                if server_info.guild_id == guild_id:
+                    monitored_count += len([
+                        ch_id for ch_id in server_info.channels.keys()
+                        if ch_id in self.monitored_announcement_channels
+                    ])
+        
+        self.logger.info(f"📊 Ready monitoring coverage for {connection_id}",
+                       monitored_channels=len(self.monitored_announcement_channels),
+                       accessible_guilds=len(guilds),
+                       monitored_in_accessible_guilds=monitored_count)
+    
+    async def _handle_message_create(self, data: Dict, connection_info: Dict) -> None:
+        """Handle MESSAGE_CREATE event - THIS IS WHERE REAL-TIME MESSAGES COME FROM"""
+        connection_id = f"token_{connection_info['token_index']}"
+        
+        try:
+            channel_id = data.get('channel_id')
+            guild_id = data.get('guild_id')
+            
+            # Only process messages from monitored channels
+            if channel_id not in self.monitored_announcement_channels:
+                return
+            
+            # Skip bot messages
+            author = data.get('author', {})
+            if author.get('bot', False):
+                return
+            
+            # Skip empty messages
+            content = data.get('content', '').strip()
+            if not content:
+                return
+            
+            # Find server name from guild_id
+            server_name = None
+            channel_name = None
+            
+            for srv_name, srv_info in self.servers.items():
+                if srv_info.guild_id == guild_id and channel_id in srv_info.channels:
+                    server_name = srv_name
+                    channel_name = srv_info.channels[channel_id].channel_name
+                    break
+            
+            if not server_name:
+                self.logger.debug(f"🤷 Unknown server for message", 
+                                guild_id=guild_id,
+                                channel_id=channel_id)
+                return
+            
+            # Create DiscordMessage object
+            message = DiscordMessage(
+                content=content,
+                timestamp=datetime.fromisoformat(
+                    data['timestamp'].replace('Z', '+00:00')
+                ),
+                server_name=server_name,
+                channel_name=channel_name,
+                author=author.get('username', 'Unknown'),
+                message_id=data.get('id'),
+                channel_id=channel_id,
+                guild_id=guild_id
+            )
+            
+            # Trigger callbacks (this sends to MessageProcessor)
+            await self._trigger_message_callbacks(message)
+            
+            self.logger.info(f"📨 WebSocket message received",
+                           connection_id=connection_id,
+                           server=server_name,
+                           channel=channel_name,
+                           author=author.get('username'),
+                           content_preview=content[:50])
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error handling MESSAGE_CREATE for {connection_id}", 
+                            error=str(e),
+                            data_keys=list(data.keys()) if data else None)
+    
+    # ============================================================================
+    # EXISTING METHODS (unchanged)
+    # ============================================================================
+    
     def notify_new_channel_added(self, server_name: str, channel_id: str, channel_name: str) -> bool:
         """Уведомление о добавлении канала"""
         try:
@@ -887,21 +1100,16 @@ class DiscordService:
                 self.logger.warning(f"Channel {channel_id} not found in server {server_name} channels")
                 return False
             
-            # Добавляем в monitored channels
+            # Add to monitored channels
             self.monitored_announcement_channels.add(channel_id)
-            
-            # НОВОЕ: Инициализируем отслеживание для polling
-            self.last_seen_message_per_channel[channel_id] = None
-            self.channel_last_poll_time[channel_id] = datetime.now()
             
             is_announcement = self._is_announcement_channel(channel_name)
             if is_announcement:
-                self.logger.info(f"✅ Added ANNOUNCEMENT channel '{channel_name}' ({channel_id}) to monitoring")
+                self.logger.info(f"✅ Added ANNOUNCEMENT channel '{channel_name}' ({channel_id}) to WebSocket monitoring")
             else:
-                self.logger.info(f"✅ Added regular channel '{channel_name}' ({channel_id}) to monitoring")
+                self.logger.info(f"✅ Added regular channel '{channel_name}' ({channel_id}) to WebSocket monitoring")
             
-            self.logger.info(f"📢 Channel '{channel_name}' WILL forward NEW messages to Telegram")
-            self.logger.info(f"🔔 Manual addition = automatic monitoring with anti-duplication")
+            self.logger.info(f"📢 Channel '{channel_name}' WILL forward NEW messages via WebSocket")
             
             # Обновляем статистику
             server_info.update_stats()
@@ -965,11 +1173,12 @@ class DiscordService:
             "monitored_channels": monitored_channels_count,
             "auto_discovered_announcement": auto_discovered_announcement,
             "manually_added_channels": manually_added_channels,
-            "monitoring_strategy": "auto announcement + manual any",
-            "polling_strategy": "new messages only - no duplicates",  # НОВОЕ
+            "monitoring_strategy": "WebSocket Real-time",
+            "websocket_connections": len(self.websocket_connections),
+            "websocket_sessions": len(self.websocket_sessions),
             "valid_sessions": len(self.sessions),
             "message_callbacks": len(self.message_callbacks),
-            "channels_with_tracking": len(self.last_seen_message_per_channel),  # НОВОЕ
+            "gateway_urls": len(self.gateway_urls),
             "servers": {name: {
                 "status": server.status.value,
                 "channels": server.channel_count,
@@ -995,17 +1204,33 @@ class DiscordService:
         """Clean up resources"""
         self.running = False
         
+        self.logger.info("🧹 Cleaning up Discord service...")
+        
         # Close all WebSocket connections
-        for ws in self.websocket_connections:
-            if not ws.closed:
-                await ws.close()
+        for connection_info in self.websocket_connections[:]:
+            try:
+                # Cancel heartbeat task
+                if connection_info.get('heartbeat_task'):
+                    connection_info['heartbeat_task'].cancel()
+                
+                # Close WebSocket
+                ws = connection_info.get('ws')
+                if ws and not ws.closed:
+                    await ws.close()
+                    
+            except Exception as e:
+                self.logger.error("Error closing WebSocket connection", error=str(e))
+        
+        # Clear connection tracking
+        self.websocket_connections.clear()
+        self.websocket_sessions.clear()
         
         # Close all HTTP sessions
         for session in self.sessions:
             if not session.closed:
                 await session.close()
         
-        self.logger.info("Discord service cleaned up (new messages only polling)")
+        self.logger.info("✅ Discord service cleaned up (WebSocket mode)")
     
     def notify_channel_removed(self, server_name: str, channel_id: str, channel_name: str) -> bool:
         """Уведомление об удалении канала из мониторинга"""
@@ -1013,13 +1238,7 @@ class DiscordService:
             if channel_id in self.monitored_announcement_channels:
                 self.monitored_announcement_channels.remove(channel_id)
                 
-            # Удаляем из отслеживания polling
-            if channel_id in self.last_seen_message_per_channel:
-                del self.last_seen_message_per_channel[channel_id]
-            if channel_id in self.channel_last_poll_time:
-                del self.channel_last_poll_time[channel_id]
-                
-            self.logger.info(f"✅ Channel '{channel_name}' ({channel_id}) removed from monitoring")
+            self.logger.info(f"✅ Channel '{channel_name}' ({channel_id}) removed from WebSocket monitoring")
             return True
             
         except Exception as e:
@@ -1066,3 +1285,37 @@ class DiscordService:
         except Exception as e:
             self.logger.error(f"Error getting channel messages: {e}")
             return []
+    
+    def get_websocket_status(self) -> Dict[str, any]:
+        """Get detailed WebSocket connection status"""
+        active_connections = []
+        
+        for connection_info in self.websocket_connections:
+            ws = connection_info.get('ws')
+            token_index = connection_info.get('token_index')
+            
+            status = {
+                'token_index': token_index,
+                'connected': ws and not ws.closed if ws else False,
+                'connected_at': connection_info.get('connected_at'),
+                'session_id': connection_info.get('session_id'),
+                'last_heartbeat': connection_info.get('last_heartbeat'),
+                'sequence': connection_info.get('sequence')
+            }
+            
+            if status['connected_at']:
+                uptime = datetime.now() - status['connected_at']
+                status['uptime_seconds'] = int(uptime.total_seconds())
+            
+            active_connections.append(status)
+        
+        return {
+            'total_connections': len(self.websocket_connections),
+            'active_connections': len([c for c in active_connections if c['connected']]),
+            'total_tokens': len(self.sessions),
+            'gateway_urls_available': len(self.gateway_urls),
+            'monitoring_enabled': self.running,
+            'connections': active_connections,
+            'intents': self.intents,
+            'monitored_channels': len(self.monitored_announcement_channels)
+        }

@@ -2,7 +2,7 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
-pydantic-settings==2.1.0  # ИСПРАВЛЕНО: отдельный пакет для BaseSettings
+pydantic-settings==2.1.0  # : отдельный пакет для BaseSettings
 
 # Dependency Injection
 dependency-injector==4.41.0

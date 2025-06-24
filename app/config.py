@@ -1,4 +1,4 @@
-# app/config.py - ИСПРАВЛЕНА ПРОБЛЕМА КЕШИРОВАНИЯ
+
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
 from typing import List, Dict, Optional
@@ -7,7 +7,7 @@ import os
 import logging
 from dotenv import load_dotenv
 
-# ИСПРАВЛЕНИЕ 1: Перезагружаем .env при каждом вызове
+# 1: Перезагружаем .env при каждом вызове
 def reload_env():
     """Принудительная перезагрузка переменных окружения"""
     load_dotenv(override=True)  # override=True заставляет перезагрузить
@@ -211,7 +211,7 @@ class Settings(BaseSettings):
         "populate_by_name": True
     }
 
-# ИСПРАВЛЕНИЕ 2: Кеш с возможностью сброса
+# 2: Кеш с возможностью сброса
 _settings_cache = None
 _env_file_mtime = None
 
@@ -255,7 +255,7 @@ def get_settings(force_reload: bool = False) -> Settings:
     
     return _settings_cache
 
-# ИСПРАВЛЕНИЕ 3: Функции для принудительной перезагрузки
+# 3: Функции для принудительной перезагрузки
 def reload_settings():
     """Принудительная перезагрузка настроек"""
     return get_settings(force_reload=True)
@@ -265,7 +265,7 @@ def get_fresh_settings() -> Settings:
     reload_env()
     return Settings()
 
-# ИСПРАВЛЕНИЕ 4: Дебаг функция для проверки текущих настроек
+# 4: Дебаг функция для проверки текущих настроек
 def debug_current_settings():
     """Показать текущие настройки для отладки"""
     settings = get_settings()

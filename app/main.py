@@ -286,7 +286,7 @@ async def sync_server(
     discord_service: DiscordService = Depends(get_discord_service_dependency),
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """ИСПРАВЛЕНО: Manually sync a specific server (only monitored channels)"""
+    """: Manually sync a specific server (only monitored channels)"""
     if server_name not in discord_service.servers:
         raise HTTPException(status_code=404, detail="Server not found")
     
@@ -297,7 +297,7 @@ async def sync_server(
             server_info = discord_service.servers[server_name]
             monitored_messages = []
             
-            # ИСПРАВЛЕНИЕ: Get messages only from monitored channels
+            # : Get messages only from monitored channels
             monitored_channels = []
             for channel_id, channel_info in server_info.accessible_channels.items():
                 if channel_id in discord_service.monitored_announcement_channels:
@@ -359,9 +359,9 @@ async def get_recent_messages(
     request: MessageRequest,
     discord_service: DiscordService = Depends(get_discord_service_dependency)
 ):
-    """ИСПРАВЛЕНО: Get recent messages from a monitored channel only"""
+    """: Get recent messages from a monitored channel only"""
     try:
-        # ИСПРАВЛЕНИЕ: Проверяем что канал мониторится
+        # : Проверяем что канал мониторится
         if request.channel_id not in discord_service.monitored_announcement_channels:
             raise HTTPException(
                 status_code=400, 
@@ -622,7 +622,7 @@ async def list_servers(
     discord_service: DiscordService = Depends(get_discord_service_dependency),
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """ИСПРАВЛЕНО: List servers with enhanced monitoring info"""
+    """: List servers with enhanced monitoring info"""
     servers_data = []
     
     for server_name, server_info in discord_service.servers.items():
@@ -686,7 +686,7 @@ async def get_server(
     discord_service: DiscordService = Depends(get_discord_service_dependency),
     telegram_service: TelegramService = Depends(get_telegram_service_dependency)
 ):
-    """ИСПРАВЛЕНО: Get detailed server info with monitoring status"""
+    """: Get detailed server info with monitoring status"""
     if server_name not in discord_service.servers:
         raise HTTPException(status_code=404, detail="Server not found")
     
@@ -775,7 +775,7 @@ async def get_server(
             "topic_verified": topic_verified,
             "can_create_topic": topic_can_create,
             "protection_active": telegram_service.startup_verification_done,
-            "note": "All monitored channels from this server post to the same Telegram topic"  # ИСПРАВЛЕНО
+            "note": "All monitored channels from this server post to the same Telegram topic"  # 
         },
         "channel_management": {
             "can_add_channels": True,

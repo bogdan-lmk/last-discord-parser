@@ -28,31 +28,31 @@ class TelegramService:
         self.redis_client = redis_client
         self.logger = logger or structlog.get_logger(__name__)
         
-        # ИСПРАВЛЕНИЕ: Инициализация бота с правильными настройками
+        # Инициализация бота с правильными настройками
         self.bot = None
         self._initialize_bot()
         
-        # ENHANCED: Topic Management with Anti-Duplicate Protection
+        #  Topic Management with Anti-Duplicate Protection
         self.server_topics: Dict[str, int] = {}  # server_name -> topic_id (ONE topic per server)
         self.topic_name_cache: Dict[int, str] = {}  # topic_id -> server_name for fast lookup
         self.user_states: Dict[int, dict] = {}  # user_id -> state for multi-step operations
         
-        # ENHANCED: Message tracking and deduplication
+        #  Message tracking and deduplication
         self.message_mappings: Dict[str, int] = {}  # timestamp -> telegram_message_id
         self.processed_messages: Dict[str, datetime] = {}  # message_id -> timestamp
         self.message_store_file = 'telegram_messages.json'
         
-        # ENHANCED: Bot state management
+        #  Bot state management
         self.bot_running = False
         self.startup_verification_done = False
         self._bot_thread = None
         
-        # ENHANCED: Thread-safe operations
+        #  Thread-safe operations
         self._async_lock = asyncio.Lock()
         self.topic_creation_lock = asyncio.Lock()
         self.topic_sync_lock = asyncio.Lock()
         
-        # ENHANCED: Callbacks and monitoring
+        #  Callbacks and monitoring
         self.new_message_callbacks: List[Callable[[DiscordMessage], None]] = []
         self.discord_service = None  # Will be set by dependency injection
         
@@ -72,16 +72,27 @@ class TelegramService:
         return False
     
     def _initialize_bot(self):
-        """ИСПРАВЛЕНИЕ: Правильная инициализация бота"""
+        """Правильная инициализация бота"""
         try:
             self.bot = telebot.TeleBot(
                 self.settings.telegram_bot_token,
                 skip_pending=True,
                 threaded=True,  
-                parse_mode=None  
+                parse_mode=None,
+                num_threads=4  
             )
+            try:
+                bot_info = self.bot.get_me()
+                self.logger.info("Telegram bot initialized successfully with safe threading", 
+                                bot_username=bot_info.username,
+                                bot_id=bot_info.id,
+                                threads=4)
+            except Exception as e:
+                self.logger.error(f"Bot test failed: {e}")
+                self.bot = None
+                return False
             
-            # ИСПРАВЛЕНИЕ: Сразу устанавливаем обработчики
+            # Сразу устанавливаем обработчики
             self._setup_bot_handlers()
             
             self.logger.info("Telegram bot initialized successfully", 
@@ -92,12 +103,12 @@ class TelegramService:
             self.bot = None
     
     def _setup_bot_handlers(self):
-        """ИСПРАВЛЕНИЕ: Настройка обработчиков бота"""
+        """Настройка обработчиков бота"""
         if not self.bot:
             self.logger.error("Cannot setup handlers - bot not initialized")
             return
         
-        # ИСПРАВЛЕНИЕ: Очищаем старые обработчики
+        # Очищаем старые обработчики
         self.bot.message_handlers.clear()
         self.bot.callback_query_handlers.clear()
         
@@ -158,7 +169,7 @@ class TelegramService:
         
         @self.bot.callback_query_handler(func=lambda call: True)
         def handle_callback_query(call):
-            """ИСПРАВЛЕННЫЙ: Обработчик callback запросов без дублирования"""
+            """ Обработчик callback запросов без дублирования"""
             try:
                 data = call.data
                 self.logger.info(f"📞 Callback received: {data} from user {call.from_user.id}")
@@ -355,13 +366,13 @@ class TelegramService:
         
         self.logger.info("Bot handlers setup completed successfully")
     
-    # ИСПРАВЛЕНИЕ 2: Заменить метод set_discord_service в TelegramService
+    #  2: Заменить метод set_discord_service в TelegramService
 
     def set_discord_service(self, discord_service):
         """Set Discord service reference for enhanced channel management"""
         self.discord_service = discord_service
         
-        # ИСПРАВЛЕНИЕ: Устанавливаем обратную ссылку правильно
+        # Устанавливаем обратную ссылку правильно
         if hasattr(discord_service, 'telegram_service_ref'):
             discord_service.telegram_service_ref = self
         
@@ -399,7 +410,7 @@ class TelegramService:
                 self.logger.info("Chat access verified with topic support", 
                                chat_id=self.settings.telegram_chat_id)
                 
-                # ENHANCED: Startup topic verification to prevent duplicates
+                #  Startup topic verification to prevent duplicates
                 await self.startup_topic_verification()
                 
                 return True
@@ -413,7 +424,7 @@ class TelegramService:
             return False
     
     async def startup_topic_verification(self) -> None:
-        """ENHANCED: Startup verification to prevent duplicate topics"""
+        """ Startup verification to prevent duplicate topics"""
         if self.startup_verification_done:
             return
             
@@ -535,7 +546,7 @@ class TelegramService:
     
 
     def _handle_servers_list(self, call):
-        """ИСПРАВЛЕНО: Полный список серверов с пагинацией"""
+        """: Полный список серверов с пагинацией"""
         try:
             # Get page number from call attribute or callback data
             page = 0
@@ -593,7 +604,7 @@ class TelegramService:
             # ПРОДОЛЖАЕМ С ПОЛНОЙ ЛОГИКОЙ ОТОБРАЖЕНИЯ СПИСКА
             
             # Pagination settings
-            servers_per_page = 8
+            servers_per_page = 6
             server_list = list(servers.keys())
             total_servers = len(server_list)
             total_pages = (total_servers + servers_per_page - 1) // servers_per_page
@@ -759,7 +770,7 @@ class TelegramService:
                     pass
             
     def _handle_servers_pagination(self, call):
-        """ИСПРАВЛЕНО: Обработка пагинации серверов"""
+        """: Обработка пагинации серверов"""
         try:
             # Extract page number from callback data
             if call.data.startswith('servers_page_'):
@@ -782,7 +793,7 @@ class TelegramService:
             
         except Exception as e:
             self.logger.error(f"Error in servers pagination: {e}")
-            self.bot.answer_callback_query(call.id, "❌ Pagination error")
+            self.bot.answer_callback_query(call.id, "❌ Pagination error") 
     
     async def _fetch_all_guilds_from_all_tokens(self) -> List[dict]:
         """Получить ВСЕ гильдии со всех доступных токенов"""
@@ -2040,13 +2051,13 @@ class TelegramService:
                 pass
     
     def _send_servers_list_message(self, message):
-        """ИСПРАВЛЕНО: Отправка списка серверов как новое сообщение"""
+        """: Отправка списка серверов как новое сообщение"""
         try:
             if not self.discord_service:
                 self.bot.reply_to(message, "❌ Discord service not available")
                 return
             
-            # ИСПРАВЛЕНИЕ: Получаем серверы из discord_service
+            # Получаем серверы из discord_service
             servers = getattr(self.discord_service, 'servers', {})
             
             if not servers:
@@ -2394,7 +2405,7 @@ class TelegramService:
 
     
     async def get_or_create_server_topic(self, server_name: str) -> Optional[int]:
-        """ENHANCED: Get or create topic with anti-duplicate protection"""
+        """ Get or create topic with anti-duplicate protection"""
         chat_id = self.settings.telegram_chat_id
         
         # Ensure startup verification is done
@@ -2746,7 +2757,7 @@ class TelegramService:
             self.logger.error(f"Error in async save: {e}")
     
     async def start_bot_async(self) -> None:
-        """ИСПРАВЛЕНИЕ: Start the enhanced Telegram bot asynchronously"""
+        """Start the enhanced Telegram bot asynchronously"""
         if self.bot_running:
             self.logger.warning("Enhanced bot is already running")
             return
@@ -2766,7 +2777,7 @@ class TelegramService:
                        features=["Anti-duplicate", "Interactive UI", "Channel management"])
         
         try:
-            # ИСПРАВЛЕНИЕ: Запускаем бота в отдельном потоке
+            # Запускаем бота в отдельном потоке
             def run_bot():
                 try:
                     self.logger.info("Bot polling started in thread")
@@ -2821,7 +2832,7 @@ class TelegramService:
             self.bot_running = False
     
     def stop_bot(self) -> None:
-        """ИСПРАВЛЕНИЕ: Stop the enhanced Telegram bot"""
+        """Stop the enhanced Telegram bot"""
         if not self.bot_running:
             self.logger.info("Bot is not running")
             return

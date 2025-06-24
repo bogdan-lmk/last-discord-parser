@@ -1,4 +1,4 @@
-
+# app/services/message_processor.py - ОБНОВЛЕННЫЙ для WebSocket
 import asyncio
 import hashlib
 import threading
@@ -13,7 +13,7 @@ from .discord_service import DiscordService
 from .telegram_service import TelegramService
 
 class MessageProcessor:
-    """Главный оркестратор - БЕЗ дублирования сообщений"""
+    """Главный оркестратор - WebSocket ONLY (БЕЗ дублирования сообщений)"""
     
     def __init__(self,
                  settings: Settings,
@@ -36,25 +36,22 @@ class MessageProcessor:
         # Background tasks
         self.tasks: List[asyncio.Task] = []
         
-        # ИСПРАВЛЕНИЕ: Улучшенная дедупликация с временными метками
+        # WebSocket message queue
         self.message_queue = asyncio.Queue(maxsize=1000)
-        self.batch_queue: List[DiscordMessage] = []
         self.redis_client = redis_client
         
-        # НОВОЕ: Отслеживание последних обработанных сообщений по каналам
+        # Channel initialization tracking
         self.last_processed_message_per_channel: Dict[str, datetime] = {}  # channel_id -> last_timestamp
         self.channel_initialization_done: Set[str] = set()  # каналы, для которых выполнена начальная инициализация
         
-        # ИСПРАВЛЕНИЕ: Глобальная дедупликация с уникальными хэшами
+        # WebSocket-only дедупликация
         self.processed_message_hashes: Set[str] = set()  # Только хэши уже обработанных сообщений
         self.message_dedup_lock = asyncio.Lock()
         
         # Real-time synchronization state
         self.realtime_enabled = True
-        self.last_sync_times: Dict[str, datetime] = {}  # server_name -> last_sync
-        self.sync_intervals: Dict[str, int] = {}  # server_name -> interval_seconds
         
-        # НОВОЕ: Более точная статистика по серверам
+        # Server statistics
         self.server_message_counts: Dict[str, int] = {}  # server_name -> count
         self.server_last_activity: Dict[str, datetime] = {}  # server_name -> timestamp
         
@@ -64,120 +61,112 @@ class MessageProcessor:
         # Periodic cleanup
         self.last_cleanup = datetime.now()
         
-        # НОВОЕ: Флаг завершения инициализации
+        # Флаг завершения инициализации
         self.initial_sync_completed = False
         
-    async def initialize(self) -> bool:
-        """Initialize all services and set up real-time integration"""
-        self.logger.info("Initializing Message Processor with anti-duplication system")
+        # WebSocket monitoring stats
+        self.websocket_messages_received = 0
+        self.websocket_messages_processed = 0
+        self.websocket_last_message_time = None
         
-        # Initialize Discord service
+    async def initialize(self) -> bool:
+        """Initialize all services and set up WebSocket integration"""
+        self.logger.info("🚀 Initializing Message Processor with WebSocket-only system")
+        
+        # Initialize Discord service (with WebSocket support)
         if not await self.discord_service.initialize():
-            self.logger.error("Discord service initialization failed")
+            self.logger.error("❌ Discord service initialization failed")
             return False
         
         # Initialize Telegram service
         if not await self.telegram_service.initialize():
-            self.logger.error("Telegram service initialization failed")
+            self.logger.error("❌ Telegram service initialization failed")
             return False
         
-        # ENHANCED: Set Discord service reference for channel management
+        # Set Discord service reference for channel management
         self.telegram_service.set_discord_service(self.discord_service)
         
-        # ИСПРАВЛЕНИЕ: Правильная регистрация колбэка
-        self.discord_service.add_message_callback(self._handle_realtime_message)
+        # Register WebSocket message callback
+        self.discord_service.add_message_callback(self._handle_websocket_message)
         
-        # Initialize sync intervals for each server
+        # Initialize server tracking
         for server_name in self.discord_service.servers.keys():
-            self.sync_intervals[server_name] = 300  # 5 minutes default
-            self.last_sync_times[server_name] = datetime.now()
             self.server_message_counts[server_name] = 0
             self.server_last_activity[server_name] = datetime.now()
         
         # Update initial statistics
         await self._update_stats()
         
-        self.logger.info("Message Processor initialized successfully",
+        self.logger.info("✅ Message Processor initialized successfully",
                         discord_servers=len(self.discord_service.servers),
                         telegram_topics=len(self.telegram_service.server_topics),
                         realtime_enabled=self.realtime_enabled,
                         monitored_channels=len(self.discord_service.monitored_announcement_channels),
+                        mode="WebSocket-only",
                         anti_duplication="ACTIVE")
         
         return True
     
-    async def _handle_realtime_message(self, message: DiscordMessage) -> None:
-        """ИСПРАВЛЕНО: Handle real-time message - только НОВЫЕ сообщения"""
+    async def _handle_websocket_message(self, message: DiscordMessage) -> None:
+        """Handle WebSocket message - ONLY process if newer than last seen"""
         try:
-            # ПРОВЕРКА 1: Канал должен быть мониторимым
-            if message.channel_id not in self.discord_service.monitored_announcement_channels:
-                self.logger.debug("Message from non-monitored channel ignored",
-                                server=message.server_name,
-                                channel=message.channel_name,
-                                channel_id=message.channel_id)
-                return
+            self.websocket_messages_received += 1
+            self.websocket_last_message_time = datetime.now()
             
-            # ПРОВЕРКА 2: Инициализация канала должна быть завершена
-            if not self.initial_sync_completed:
-                self.logger.debug("Initial sync not completed yet, queuing real-time message",
+            # Check if channel is monitored
+            if message.channel_id not in self.discord_service.monitored_announcement_channels:
+                self.logger.debug("🚫 Non-monitored channel message ignored",
                                 server=message.server_name,
                                 channel=message.channel_name)
-                # Пока инициализация не завершена, ставим в очередь
+                return
+            
+            # Check if channel initialized (initial sync must be complete)
+            if not self.initial_sync_completed or message.channel_id not in self.channel_initialization_done:
+                self.logger.debug("⏳ Channel not initialized yet, queuing message",
+                                server=message.server_name,
+                                channel=message.channel_name)
+                
+                # Queue for processing after initialization
                 try:
                     await asyncio.wait_for(self.message_queue.put(message), timeout=1.0)
                 except asyncio.TimeoutError:
-                    self.logger.warning("Real-time queue full during initialization")
+                    self.logger.warning("⚠️ Queue timeout during initialization")
                 return
             
-            # ПРОВЕРКА 3: Канал должен быть инициализирован
-            if message.channel_id not in self.channel_initialization_done:
-                self.logger.debug("Channel not initialized yet, skipping real-time message",
-                                channel_id=message.channel_id)
-                return
-            
-            # ПРОВЕРКА 4: Сообщение должно быть новее последнего обработанного
+            # Check if message is newer than last processed
             last_processed = self.last_processed_message_per_channel.get(message.channel_id)
             if last_processed and message.timestamp <= last_processed:
-                self.logger.debug("Real-time message is not newer than last processed, skipping",
+                self.logger.debug("🔄 Message not newer than last processed, skipping",
                                 channel_id=message.channel_id,
                                 message_timestamp=message.timestamp.isoformat(),
                                 last_processed_timestamp=last_processed.isoformat())
                 return
             
-            # ПРОВЕРКА 5: Дедупликация по хэшу
+            # Deduplication check
             message_hash = self._create_message_hash(message)
             async with self.message_dedup_lock:
                 if message_hash in self.processed_message_hashes:
-                    self.logger.debug("Duplicate real-time message ignored",
+                    self.logger.debug("🔂 Duplicate WebSocket message ignored",
                                     message_hash=message_hash[:8],
                                     server=message.server_name)
                     return
-                
-                # Добавляем в processed хэши
                 self.processed_message_hashes.add(message_hash)
             
-            # ПРОВЕРКА 6: Rate limiting
+            # Rate limit check
             if not self._check_rate_limit(message.server_name, is_realtime=True):
-                self.logger.warning("Rate limit exceeded for real-time message", 
+                self.logger.warning("🚦 Rate limit exceeded for WebSocket message", 
                                   server=message.server_name)
                 return
             
-            # ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - обрабатываем сообщение
+            # Queue the message for processing
             try:
-                await asyncio.wait_for(
-                    self.message_queue.put(message), 
-                    timeout=2.0
-                )
-                
-                # Обновляем последнее обработанное время для канала
+                await asyncio.wait_for(self.message_queue.put(message), timeout=2.0)
                 self.last_processed_message_per_channel[message.channel_id] = message.timestamp
-                
-                # Update tracking
                 self._update_rate_tracking(message.server_name)
                 self.server_last_activity[message.server_name] = datetime.now()
                 
                 channel_type = "announcement" if self._is_announcement_channel(message.channel_name) else "regular"
-                self.logger.info("NEW real-time message queued", 
+                self.logger.info("📨 NEW WebSocket message queued", 
                                server=message.server_name,
                                channel=message.channel_name,
                                channel_type=channel_type,
@@ -186,19 +175,19 @@ class MessageProcessor:
                                message_hash=message_hash[:8])
                 
             except asyncio.TimeoutError:
-                self.logger.error("Message queue timeout - dropping real-time message",
+                self.logger.error("❌ Message queue timeout - dropping WebSocket message",
                                 server=message.server_name,
                                 queue_size=self.message_queue.qsize())
                 self.stats.errors_last_hour += 1
                 
         except Exception as e:
-            self.logger.error("Error handling real-time message",
+            self.logger.error("❌ Error handling WebSocket message",
                             server=message.server_name,
                             error=str(e))
             self.stats.errors_last_hour += 1
     
     def _create_message_hash(self, message: DiscordMessage) -> str:
-        """ИСПРАВЛЕНО: Create unique hash for message"""
+        """Create unique hash for message"""
         hash_input = (
             f"{message.guild_id}:"
             f"{message.channel_id}:"
@@ -212,7 +201,7 @@ class MessageProcessor:
     def _is_announcement_channel(self, channel_name: str) -> bool:
         """Проверка что канал является announcement"""
         channel_lower = channel_name.lower()
-        return channel_lower in self.settings.channel_keywords
+        return any(keyword in channel_lower for keyword in self.settings.channel_keywords)
     
     def _check_rate_limit(self, server_name: str, is_realtime: bool = False) -> bool:
         """Check if server is within rate limits"""
@@ -228,7 +217,7 @@ class MessageProcessor:
             if ts > window_start
         ]
         
-        # More relaxed limits for real-time messages
+        # More relaxed limits for WebSocket real-time messages
         limit = 60 if is_realtime else 30
         
         return len(self.message_rate_tracker[server_name]) < limit
@@ -245,40 +234,45 @@ class MessageProcessor:
         self.server_message_counts[server_name] += 1
     
     async def start(self) -> None:
-        """Start the message processor and all background tasks"""
+        """Start the message processor and WebSocket monitoring"""
         if self.running:
-            self.logger.warning("Message processor is already running")
+            self.logger.warning("⚠️ Message processor is already running")
             return
         
         self.running = True
         self.start_time = datetime.now()
         
-        self.logger.info("Starting Message Processor with anti-duplication system")
+        self.logger.info("🚀 Starting Message Processor with WebSocket-only system")
         
         # Start background tasks
         self.tasks = [
-            asyncio.create_task(self._realtime_message_processor_loop()),
-            asyncio.create_task(self._batch_processor_loop()),
-            asyncio.create_task(self._periodic_sync_loop()),
-            asyncio.create_task(self._cleanup_loop()),
-            asyncio.create_task(self._stats_update_loop()),
-            asyncio.create_task(self._health_check_loop()),
-            asyncio.create_task(self._rate_limit_cleanup_loop()),
-            asyncio.create_task(self._deduplication_cleanup_loop())
+            asyncio.create_task(self._websocket_message_processor_loop(), name="websocket_processor"),
+            asyncio.create_task(self._cleanup_loop(), name="cleanup"),
+            asyncio.create_task(self._stats_update_loop(), name="stats"),
+            asyncio.create_task(self._health_check_loop(), name="health"),
+            asyncio.create_task(self._rate_limit_cleanup_loop(), name="rate_limit_cleanup"),
+            asyncio.create_task(self._deduplication_cleanup_loop(), name="dedup_cleanup"),
+            asyncio.create_task(self._websocket_stats_loop(), name="websocket_stats")
         ]
         
-        # Start Discord monitoring (HTTP polling for monitored channels)
-        discord_task = asyncio.create_task(self.discord_service.start_websocket_monitoring())
+        # Start Discord WebSocket monitoring
+        discord_task = asyncio.create_task(
+            self.discord_service.start_websocket_monitoring(), 
+            name="discord_websocket"
+        )
         self.tasks.append(discord_task)
         
-        # Start Telegram bot asynchronously
-        telegram_task = asyncio.create_task(self.telegram_service.start_bot_async())
+        # Start Telegram bot
+        telegram_task = asyncio.create_task(
+            self.telegram_service.start_bot_async(), 
+            name="telegram_bot"
+        )
         self.tasks.append(telegram_task)
         
-        # ИСПРАВЛЕНИЕ: Perform initial sync ТОЛЬКО ОДИН РАЗ
+        # Perform initial sync ТОЛЬКО ОДИН РАЗ (2 сообщения)
         await self._perform_initial_sync_once()
         
-        self.logger.info("Message Processor started successfully - ready for real-time monitoring")
+        self.logger.info("✅ Message Processor started successfully - WebSocket monitoring active")
         
         try:
             # Wait for all tasks with error isolation
@@ -287,11 +281,11 @@ class MessageProcessor:
             # Log any individual task failures
             for task in self.tasks:
                 if task.done() and task.exception():
-                    self.logger.error("Task failed",
+                    self.logger.error("❌ Task failed",
                                    task_name=task.get_name(),
                                    error=str(task.exception()))
         except Exception as e:
-            self.logger.error("Critical error in message processor", error=str(e))
+            self.logger.error("❌ Critical error in message processor", error=str(e))
         finally:
             await self.stop()
     
@@ -301,7 +295,7 @@ class MessageProcessor:
             return
         
         self.running = False
-        self.logger.info("Stopping Message Processor")
+        self.logger.info("🛑 Stopping Message Processor")
         
         # Cancel all tasks
         for task in self.tasks:
@@ -315,15 +309,15 @@ class MessageProcessor:
         await self.discord_service.cleanup()
         await self.telegram_service.cleanup()
         
-        self.logger.info("Message Processor stopped")
+        self.logger.info("✅ Message Processor stopped")
     
     async def _perform_initial_sync_once(self) -> None:
-        """ИСПРАВЛЕНО: Выполнить начальную синхронизацию ТОЛЬКО ОДИН РАЗ"""
+        """Выполнить начальную синхронизацию ТОЛЬКО 2 сообщения"""
         if self.initial_sync_completed:
-            self.logger.warning("Initial sync already completed, skipping")
+            self.logger.warning("⚠️ Initial sync already completed, skipping")
             return
             
-        self.logger.info("🚀 Starting INITIAL synchronization (last 5 messages per channel, ONCE)")
+        self.logger.info("🚀 Starting INITIAL synchronization (last 2 messages per channel, ONCE)")
         
         total_messages = 0
         
@@ -341,11 +335,11 @@ class MessageProcessor:
                 try:
                     self.logger.info(f"📥 Getting initial messages from channel {channel_info.channel_name} ({channel_id})")
                     
-                    # Get last 5 messages for initial sync
+                    # Get last 2 messages for initial sync
                     messages = await self.discord_service.get_recent_messages(
                         server_name,
                         channel_id,
-                        limit=5
+                        limit=2
                     )
                     
                     if messages:
@@ -373,7 +367,7 @@ class MessageProcessor:
                     self.channel_initialization_done.add(channel_id)
                     
                 except Exception as e:
-                    self.logger.error("Error getting initial messages",
+                    self.logger.error("❌ Error getting initial messages",
                                     server=server_name,
                                     channel_id=channel_id,
                                     error=str(e))
@@ -387,10 +381,9 @@ class MessageProcessor:
                 sent_count = await self.telegram_service.send_messages_batch(server_messages)
                 
                 total_messages += sent_count
-                self.last_sync_times[server_name] = datetime.now()
                 self.server_message_counts[server_name] = sent_count
                 
-                self.logger.info("Initial sync for server complete",
+                self.logger.info("✅ Initial sync for server complete",
                                server=server_name,
                                messages_sent=sent_count,
                                total_messages=len(server_messages),
@@ -401,15 +394,15 @@ class MessageProcessor:
         
         self.stats.messages_processed_total += total_messages
         
-        self.logger.info("🎉 INITIAL synchronization COMPLETED - now monitoring only NEW messages",
+        self.logger.info("🎉 INITIAL synchronization COMPLETED - now monitoring only NEW WebSocket messages",
                         total_messages=total_messages,
                         servers_synced=len([s for s in self.discord_service.servers.values() 
                                           if s.status == ServerStatus.ACTIVE]),
                         initialized_channels=len(self.channel_initialization_done))
     
-    async def _realtime_message_processor_loop(self) -> None:
-        """Real-time message processing loop - только НОВЫЕ сообщения"""
-        self.logger.info("Starting real-time message processor loop (NEW messages only)")
+    async def _websocket_message_processor_loop(self) -> None:
+        """WebSocket message processing loop - только НОВЫЕ сообщения"""
+        self.logger.info("👂 Starting WebSocket message processor loop")
         
         while self.running:
             try:
@@ -420,21 +413,21 @@ class MessageProcessor:
                     continue
                 
                 # Process message immediately for real-time sync
-                await self._process_realtime_message(message)
+                await self._process_websocket_message(message)
                 
                 # Mark task as done
                 self.message_queue.task_done()
                 
             except Exception as e:
-                self.logger.error("Error in real-time message processor loop", error=str(e))
+                self.logger.error("❌ Error in WebSocket message processor loop", error=str(e))
                 await asyncio.sleep(1)
     
-    async def _process_realtime_message(self, message: DiscordMessage) -> None:
-        """ИСПРАВЛЕНО: Process a real-time Discord message - только НОВЫЕ"""
+    async def _process_websocket_message(self, message: DiscordMessage) -> None:
+        """Process a WebSocket Discord message - только НОВЫЕ"""
         try:
             # Проверяем что канал мониторится
             if message.channel_id not in self.discord_service.monitored_announcement_channels:
-                self.logger.debug("Non-monitored channel message skipped in processing",
+                self.logger.debug("🚫 Non-monitored channel message skipped in processing",
                                 server=message.server_name,
                                 channel=message.channel_name)
                 return
@@ -446,6 +439,7 @@ class MessageProcessor:
                 if success:
                     self.stats.messages_processed_today += 1
                     self.stats.messages_processed_total += 1
+                    self.websocket_messages_processed += 1
                     self.server_message_counts[message.server_name] += 1
                     
                     # Update last processed time for this channel
@@ -456,18 +450,19 @@ class MessageProcessor:
                         await self._cache_message_in_redis(message)
                     
                     channel_type = "announcement" if self._is_announcement_channel(message.channel_name) else "regular"
-                    self.logger.info("✅ NEW real-time message processed and sent",
+                    self.logger.info("✅ NEW WebSocket message processed and sent",
                                    server=message.server_name,
                                    channel=message.channel_name,
                                    channel_type=channel_type,
+                                   author=message.author,
                                    total_today=self.stats.messages_processed_today,
                                    server_total=self.server_message_counts[message.server_name])
                 else:
                     self.stats.errors_last_hour += 1
-                    self.stats.last_error = "Failed to send real-time message to Telegram"
+                    self.stats.last_error = "Failed to send WebSocket message to Telegram"
                     self.stats.last_error_time = datetime.now()
                     
-                    self.logger.error("Failed to process real-time message",
+                    self.logger.error("❌ Failed to process WebSocket message",
                                     server=message.server_name,
                                     channel=message.channel_name)
             
@@ -477,16 +472,16 @@ class MessageProcessor:
                 self.stats.last_error_time = datetime.now()
                 
                 if "message thread not found" in str(e).lower():
-                    self.logger.warning("Telegram topic not found, will retry in next sync",
+                    self.logger.warning("⚠️ Telegram topic not found for WebSocket message",
                                       server=message.server_name,
                                       channel=message.channel_name)
                 else:
-                    self.logger.error("Error sending message to Telegram",
+                    self.logger.error("❌ Error sending WebSocket message to Telegram",
                                     server=message.server_name,
                                     error=str(e))
             
         except Exception as e:
-            self.logger.error("Error processing real-time message", 
+            self.logger.error("❌ Error processing WebSocket message", 
                             server=message.server_name,
                             error=str(e))
             
@@ -507,122 +502,7 @@ class MessageProcessor:
                 message.model_dump_json()
             )
         except Exception as e:
-            self.logger.error("Failed to cache message in Redis", error=str(e))
-    
-    async def _batch_processor_loop(self) -> None:
-        """Batch message processing loop - отключен для избежания дублирования"""
-        # ИСПРАВЛЕНИЕ: Отключаем batch processing, чтобы избежать дублирование
-        # Все сообщения обрабатываются через real-time processor
-        while self.running:
-            await asyncio.sleep(60)  # Just sleep, don't process anything
-    
-    async def _periodic_sync_loop(self) -> None:
-        """ИСПРАВЛЕНО: Periodic fallback sync - только для missed messages"""
-        while self.running:
-            try:
-                # Run fallback check every 10 minutes (только если real-time не работает)
-                await asyncio.sleep(600)
-                
-                # Только если initial sync завершен
-                if not self.initial_sync_completed:
-                    continue
-                
-                self.logger.debug("Checking for missed messages (fallback sync)")
-                
-                # Check each server for VERY recent missed messages (last 2 minutes)
-                cutoff_time = datetime.now() - timedelta(minutes=2)
-                
-                for server_name, last_sync in self.last_sync_times.items():
-                    try:
-                        # Skip if recently synced via real-time
-                        if (datetime.now() - last_sync).total_seconds() < 120:
-                            continue
-                        
-                        await self._sync_server_missed_messages_only(server_name, cutoff_time)
-                        
-                    except Exception as e:
-                        self.logger.error("Error in periodic sync for server",
-                                        server=server_name,
-                                        error=str(e))
-                
-            except Exception as e:
-                self.logger.error("Error in periodic sync loop", error=str(e))
-                await asyncio.sleep(300)
-    
-    async def _sync_server_missed_messages_only(self, server_name: str, cutoff_time: datetime) -> None:
-        """ИСПРАВЛЕНО: Sync only very recent missed messages"""
-        if server_name not in self.discord_service.servers:
-            return
-        
-        server_info = self.discord_service.servers[server_name]
-        if server_info.status != ServerStatus.ACTIVE:
-            return
-        
-        missed_messages = []
-        
-        # Check each monitored channel for very recent messages
-        for channel_id, channel_info in server_info.accessible_channels.items():
-            if channel_id not in self.discord_service.monitored_announcement_channels:
-                continue
-            
-            try:
-                # Get only very recent messages (last 2 minutes)
-                messages = await self.discord_service.get_recent_messages(
-                    server_name, channel_id, limit=3
-                )
-                
-                last_processed = self.last_processed_message_per_channel.get(channel_id)
-                
-                # Ensure timezone-aware comparison
-                from ..models.message import normalize_datetime
-                aware_cutoff = normalize_datetime(cutoff_time)
-                if last_processed:
-                    last_processed = normalize_datetime(last_processed)
-                
-                for msg in messages:
-                    # Only if message is newer than cutoff AND newer than last processed
-                    if (msg.timestamp > aware_cutoff and 
-                        (not last_processed or msg.timestamp > last_processed)):
-                        
-                        msg_hash = self._create_message_hash(msg)
-                        
-                        # Check if not already processed
-                        async with self.message_dedup_lock:
-                            if msg_hash not in self.processed_message_hashes:
-                                missed_messages.append(msg)
-                                self.processed_message_hashes.add(msg_hash)
-                                # Update last processed time
-                                self.last_processed_message_per_channel[channel_id] = msg.timestamp
-            
-            except Exception as e:
-                self.logger.error("Error in missed messages check",
-                                server=server_name,
-                                channel_id=channel_id,
-                                error=str(e))
-        
-        if missed_messages:
-            # Sort and send with error handling
-            missed_messages.sort(key=lambda x: x.timestamp, reverse=False)
-            
-            try:
-                sent_count = await self.telegram_service.send_messages_batch(missed_messages)
-                
-                self.logger.info("Fallback sync found missed messages",
-                           server=server_name,
-                           messages_sent=sent_count,
-                           total_messages=len(missed_messages))
-                
-                # Update sync time
-                self.last_sync_times[server_name] = datetime.now()
-                
-            except Exception as e:
-                if "message thread not found" in str(e).lower():
-                    self.logger.warning("Topic not found during fallback sync, will retry next cycle",
-                                      server=server_name)
-                else:
-                    self.logger.error("Error sending missed messages batch",
-                                    server=server_name,
-                                    error=str(e))
+            self.logger.error("❌ Failed to cache message in Redis", error=str(e))
     
     async def _cleanup_loop(self) -> None:
         """Periodic cleanup loop"""
@@ -646,12 +526,14 @@ class MessageProcessor:
                 
                 self.last_cleanup = now
                 
-                self.logger.info("Cleanup completed",
+                self.logger.info("🧹 Cleanup completed",
                                processed_hashes=len(self.processed_message_hashes),
-                               initialized_channels=len(self.channel_initialization_done))
+                               initialized_channels=len(self.channel_initialization_done),
+                               websocket_messages_received=self.websocket_messages_received,
+                               websocket_messages_processed=self.websocket_messages_processed)
                 
             except Exception as e:
-                self.logger.error("Error in cleanup loop", error=str(e))
+                self.logger.error("❌ Error in cleanup loop", error=str(e))
                 await asyncio.sleep(300)
     
     async def _rate_limit_cleanup_loop(self) -> None:
@@ -672,12 +554,12 @@ class MessageProcessor:
                     new_count = len(self.message_rate_tracker[server_name])
                     
                     if old_count != new_count:
-                        self.logger.debug("Cleaned rate tracking data",
+                        self.logger.debug("🧹 Cleaned rate tracking data",
                                         server=server_name,
                                         removed_count=old_count - new_count)
                 
             except Exception as e:
-                self.logger.error("Error in rate limit cleanup loop", error=str(e))
+                self.logger.error("❌ Error in rate limit cleanup loop", error=str(e))
                 await asyncio.sleep(300)
     
     async def _deduplication_cleanup_loop(self) -> None:
@@ -694,33 +576,16 @@ class MessageProcessor:
                         # Keep only newer half (this is rough, but prevents unlimited growth)
                         self.processed_message_hashes = set(hashes_list[-5000:])
                         
-                        self.logger.info("Cleaned old message hashes",
+                        self.logger.info("🧹 Cleaned old message hashes",
                                        removed_count=len(hashes_list) - 5000,
                                        remaining_count=len(self.processed_message_hashes))
                 
-                # Clean old rate tracking data
-                cutoff_time = datetime.now() - timedelta(minutes=10)
-                
-                for server_name in list(self.message_rate_tracker.keys()):
-                    old_count = len(self.message_rate_tracker[server_name])
-                    self.message_rate_tracker[server_name] = [
-                        ts for ts in self.message_rate_tracker[server_name]
-                        if ts > cutoff_time
-                    ]
-                    
-                    new_count = len(self.message_rate_tracker[server_name])
-                    
-                    if old_count != new_count:
-                        self.logger.debug("Cleaned rate tracking data",
-                                        server=server_name,
-                                        removed_count=old_count - new_count)
-                
-                self.logger.debug("Deduplication cleanup completed",
+                self.logger.debug("🧹 Deduplication cleanup completed",
                                 processed_hashes=len(self.processed_message_hashes),
                                 initialized_channels=len(self.channel_initialization_done))
                 
             except Exception as e:
-                self.logger.error("Error in deduplication cleanup loop", error=str(e))
+                self.logger.error("❌ Error in deduplication cleanup loop", error=str(e))
                 await asyncio.sleep(300)
     
     async def _stats_update_loop(self) -> None:
@@ -731,8 +596,28 @@ class MessageProcessor:
                 await self._update_stats()
                 
             except Exception as e:
-                self.logger.error("Error in stats update loop", error=str(e))
+                self.logger.error("❌ Error in stats update loop", error=str(e))
                 await asyncio.sleep(60)
+    
+    async def _websocket_stats_loop(self) -> None:
+        """WebSocket statistics update loop"""
+        while self.running:
+            try:
+                await asyncio.sleep(300)  # Every 5 minutes
+                
+                # Get WebSocket status
+                ws_status = self.discord_service.get_websocket_status()
+                
+                self.logger.info("📊 WebSocket Stats Update",
+                               active_connections=ws_status.get('active_connections', 0),
+                               total_connections=ws_status.get('total_connections', 0),
+                               messages_received=self.websocket_messages_received,
+                               messages_processed=self.websocket_messages_processed,
+                               last_message=self.websocket_last_message_time.isoformat() if self.websocket_last_message_time else None)
+                
+            except Exception as e:
+                self.logger.error("❌ Error in WebSocket stats loop", error=str(e))
+                await asyncio.sleep(300)
     
     async def _health_check_loop(self) -> None:
         """Health check loop"""
@@ -740,8 +625,9 @@ class MessageProcessor:
             try:
                 await asyncio.sleep(self.settings.health_check_interval)
                 
-                # Check Discord service health
-                discord_healthy = len(self.discord_service.sessions) > 0
+                # Check Discord WebSocket health
+                ws_status = self.discord_service.get_websocket_status()
+                discord_healthy = ws_status.get('active_connections', 0) > 0
                 
                 # Check Telegram service health  
                 telegram_healthy = self.telegram_service.bot_running
@@ -755,23 +641,33 @@ class MessageProcessor:
                 # Check initialization status
                 init_healthy = self.initial_sync_completed
                 
+                # Check WebSocket message flow
+                message_flow_healthy = True
+                if self.websocket_last_message_time:
+                    time_since_last = datetime.now() - self.websocket_last_message_time
+                    # Alert if no messages for 1 hour (this might be normal)
+                    message_flow_healthy = time_since_last.total_seconds() < 3600
+                
                 if not (discord_healthy and telegram_healthy and queue_healthy and dedup_healthy and init_healthy):
-                    self.logger.warning("Health check failed",
-                                      discord_healthy=discord_healthy,
+                    self.logger.warning("⚠️ Health check failed",
+                                      discord_websocket_healthy=discord_healthy,
                                       telegram_healthy=telegram_healthy,
                                       queue_healthy=queue_healthy,
                                       dedup_healthy=dedup_healthy,
                                       init_completed=init_healthy,
+                                      message_flow_healthy=message_flow_healthy,
                                       queue_size=self.message_queue.qsize(),
-                                      processed_hashes=len(self.processed_message_hashes))
+                                      processed_hashes=len(self.processed_message_hashes),
+                                      websocket_connections=ws_status.get('active_connections', 0))
                 else:
-                    self.logger.debug("Health check passed",
+                    self.logger.debug("✅ Health check passed",
                                     queue_size=self.message_queue.qsize(),
                                     processed_hashes=len(self.processed_message_hashes),
-                                    initialized_channels=len(self.channel_initialization_done))
+                                    initialized_channels=len(self.channel_initialization_done),
+                                    websocket_connections=ws_status.get('active_connections', 0))
                 
             except Exception as e:
-                self.logger.error("Error in health check loop", error=str(e))
+                self.logger.error("❌ Error in health check loop", error=str(e))
                 await asyncio.sleep(60)
     
     async def _update_stats(self) -> None:
@@ -802,10 +698,10 @@ class MessageProcessor:
             )
             
         except Exception as e:
-            self.logger.error("Error updating stats", error=str(e))
+            self.logger.error("❌ Error updating stats", error=str(e))
     
     def get_status(self) -> Dict[str, any]:
-        """Get comprehensive system status with anti-duplication info"""
+        """Get comprehensive system status with WebSocket info"""
         discord_stats = self.discord_service.get_server_stats()
         
         # Enhanced статистики Telegram
@@ -821,6 +717,9 @@ class MessageProcessor:
             }
         except Exception as e:
             enhanced_features = {"error": str(e), "available": False}
+        
+        # WebSocket статистики
+        ws_status = self.discord_service.get_websocket_status()
         
         # Подсчет типов каналов
         announcement_channels = 0
@@ -842,13 +741,14 @@ class MessageProcessor:
                 "status": self.stats.status,
                 "realtime_enabled": self.realtime_enabled,
                 "initial_sync_completed": self.initial_sync_completed,
-                "version": "Anti-duplication версия - только новые сообщения"
+                "version": "WebSocket-only версия - real-time messages",
+                "mode": "WebSocket Real-time"
             },
             "discord": {
                 **discord_stats,
                 "auto_discovered_announcement": announcement_channels,
                 "manually_added_channels": manually_added_channels,
-                "monitoring_strategy": "auto announcement + manual any"
+                "monitoring_strategy": "WebSocket Real-time"
             },
             "telegram": {
                 "topics": len(self.telegram_service.server_topics),
@@ -859,7 +759,6 @@ class MessageProcessor:
             },
             "processing": {
                 "queue_size": self.message_queue.qsize(),
-                "batch_size": len(self.batch_queue),
                 "messages_today": self.stats.messages_processed_today,
                 "messages_total": self.stats.messages_processed_total,
                 "errors_last_hour": self.stats.errors_last_hour,
@@ -868,6 +767,13 @@ class MessageProcessor:
                 "processed_hashes": len(self.processed_message_hashes),
                 "initialized_channels": len(self.channel_initialization_done),
                 "anti_duplication": "ACTIVE"
+            },
+            "websocket": {
+                "status": ws_status,
+                "messages_received": self.websocket_messages_received,
+                "messages_processed": self.websocket_messages_processed,
+                "last_message_time": self.websocket_last_message_time.isoformat() if self.websocket_last_message_time else None,
+                "processing_rate": round(self.websocket_messages_processed / max(1, self.websocket_messages_received) * 100, 2) if self.websocket_messages_received > 0 else 0
             },
             "rate_limiting": {
                 "discord": self.discord_service.rate_limiter.get_stats(),
@@ -878,7 +784,6 @@ class MessageProcessor:
                 server_name: {
                     "message_count": self.server_message_counts.get(server_name, 0),
                     "last_activity": self.server_last_activity.get(server_name, datetime.now()).isoformat(),
-                    "last_sync": self.last_sync_times.get(server_name, datetime.now()).isoformat(),
                     "announcement_channels": len([
                         ch for ch in self.discord_service.servers[server_name].accessible_channels.values()
                         if ch.channel_id in self.discord_service.monitored_announcement_channels
@@ -904,10 +809,11 @@ class MessageProcessor:
                     ch_id: timestamp.isoformat() 
                     for ch_id, timestamp in self.last_processed_message_per_channel.items()
                 },
-                "strategy": "Initial sync (last 5) + real-time only NEW messages"
+                "strategy": "WebSocket Real-time - no polling, no duplicates"
             }
         }
     
+    # Остальные методы остаются без изменений
     def reset_channel_initialization(self, channel_id: str) -> bool:
         """Сброс инициализации канала (для debug/maintenance)"""
         try:
@@ -935,13 +841,18 @@ class MessageProcessor:
             self.processed_message_hashes.clear()
             self.initial_sync_completed = False
             
-            self.logger.warning("Forced reinitialization of all channels", 
+            # Reset WebSocket stats
+            self.websocket_messages_received = 0
+            self.websocket_messages_processed = 0
+            self.websocket_last_message_time = None
+            
+            self.logger.warning("🔄 Forced reinitialization of all channels (WebSocket mode)", 
                               previous_initialized_count=old_count)
             
             return old_count
             
         except Exception as e:
-            self.logger.error("Error in force reinitialize", error=str(e))
+            self.logger.error("❌ Error in force reinitialize", error=str(e))
             return 0
     
     def get_channel_status(self, channel_id: str) -> Dict[str, any]:
@@ -956,7 +867,8 @@ class MessageProcessor:
             "in_server": any(
                 channel_id in server_info.channels.keys() 
                 for server_info in self.discord_service.servers.values()
-            )
+            ),
+            "websocket_coverage": True  # All monitored channels have WebSocket coverage
         }
     
     def get_anti_duplication_stats(self) -> Dict[str, any]:
@@ -983,10 +895,64 @@ class MessageProcessor:
                 "newest_timestamp": max(self.last_processed_message_per_channel.values()).isoformat() 
                                   if self.last_processed_message_per_channel else None
             },
+            "websocket": {
+                "messages_received": self.websocket_messages_received,
+                "messages_processed": self.websocket_messages_processed,
+                "last_message_time": self.websocket_last_message_time.isoformat() if self.websocket_last_message_time else None,
+                "processing_efficiency": round(self.websocket_messages_processed / max(1, self.websocket_messages_received) * 100, 2) if self.websocket_messages_received > 0 else 100
+            },
             "system_health": {
                 "queue_size": self.message_queue.qsize(),
                 "rate_tracking_active": len(self.message_rate_tracker),
                 "system_running": self.running,
-                "realtime_enabled": self.realtime_enabled
+                "realtime_enabled": self.realtime_enabled,
+                "websocket_status": self.discord_service.get_websocket_status()
+            }
+        }
+    
+    def get_websocket_performance_stats(self) -> Dict[str, any]:
+        """Получить статистику производительности WebSocket"""
+        ws_status = self.discord_service.get_websocket_status()
+        
+        # Calculate message processing rate
+        processing_rate = 0
+        if self.websocket_messages_received > 0:
+            processing_rate = round(self.websocket_messages_processed / self.websocket_messages_received * 100, 2)
+        
+        # Calculate uptime for each connection
+        connection_uptimes = []
+        for conn in ws_status.get('connections', []):
+            if conn.get('connected') and conn.get('connected_at'):
+                try:
+                    connected_at = datetime.fromisoformat(conn['connected_at']) if isinstance(conn['connected_at'], str) else conn['connected_at']
+                    uptime_seconds = (datetime.now() - connected_at).total_seconds()
+                    connection_uptimes.append(uptime_seconds)
+                except:
+                    pass
+        
+        return {
+            "websocket_connections": {
+                "total": ws_status.get('total_connections', 0),
+                "active": ws_status.get('active_connections', 0),
+                "success_rate": round(ws_status.get('active_connections', 0) / max(1, ws_status.get('total_tokens', 1)) * 100, 2)
+            },
+            "message_processing": {
+                "received": self.websocket_messages_received,
+                "processed": self.websocket_messages_processed,
+                "processing_rate_percent": processing_rate,
+                "queue_size": self.message_queue.qsize(),
+                "last_message": self.websocket_last_message_time.isoformat() if self.websocket_last_message_time else None
+            },
+            "connection_health": {
+                "average_uptime_seconds": sum(connection_uptimes) / len(connection_uptimes) if connection_uptimes else 0,
+                "total_connections_attempted": len(self.discord_service.gateway_urls),
+                "successful_connections": ws_status.get('active_connections', 0),
+                "monitored_channels": len(self.discord_service.monitored_announcement_channels)
+            },
+            "performance_indicators": {
+                "real_time_delivery": processing_rate >= 95,
+                "connection_stability": ws_status.get('active_connections', 0) >= len(self.discord_service.gateway_urls) * 0.8,
+                "queue_health": self.message_queue.qsize() < 100,
+                "deduplication_efficiency": len(self.processed_message_hashes) < 10000
             }
         }
